@@ -30,6 +30,8 @@ import hashlib
 import threading
 import time
 import re
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional, Dict, Any, Tuple
@@ -75,6 +77,9 @@ POLL_INTERVAL = 3
 UA = ("Mozilla/5.0 (Linux; Android 13; V2116 Build/TP1A.220624.014_NONFC) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.7632.120 Mobile Safari/537.36")
 SHARED_SECRET = os.getenv("SHARED_SECRET", "Frankpat1@")
+
+# PostgreSQL for Railway persistence
+DATABASE_URL = os.getenv("DATABASE_URL")  # Railway auto-injects this
 
 # ----------------------------------------------------------------------
 # Task4U platform for hourly mode (separate from wsjob)
@@ -123,17 +128,30 @@ _wacash_fire_lock = threading.Lock()
 # ----------------------------------------------------------------------
 @contextmanager
 def get_db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    if DATABASE_URL:
+        # PostgreSQL for Railway
+        conn = psycopg2.connect(DATABASE_URL)
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    else:
+        # SQLite for local testing
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 def _hash_pw(p):
     try:
@@ -218,161 +236,406 @@ def _increment_daily_msgs(db, user_id: int, count: int = 1):
 
 def init_db():
     with get_db() as db:
-        db.executescript("""
-        CREATE TABLE IF NOT EXISTS users(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER UNIQUE,
-            username TEXT,
-            password TEXT,
-            is_admin INTEGER DEFAULT 0,
-            balance REAL DEFAULT 0,
-            referral_code TEXT UNIQUE,
-            referred_by INTEGER,
-            is_banned INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT(datetime('now')));
-        CREATE TABLE IF NOT EXISTS auth_tokens(
-            token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS numbers(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
-            account TEXT NOT NULL, wsid INTEGER, status TEXT DEFAULT 'pairing',
-            pair_code TEXT, msgs_sent INTEGER DEFAULT 0,
-            added_at TEXT DEFAULT(datetime('now')), UNIQUE(user_id,account));
-        CREATE TABLE IF NOT EXISTS auto_numbers(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
-            account TEXT NOT NULL, acct_type TEXT DEFAULT 'personal',
-            send_limit TEXT DEFAULT 'nolimit', status TEXT DEFAULT 'pending',
-            pair_code TEXT, msgs_sent INTEGER DEFAULT 0,
-            added_at TEXT DEFAULT(datetime('now')), UNIQUE(user_id,account));
-        CREATE TABLE IF NOT EXISTS pending_tasks(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            account TEXT NOT NULL UNIQUE,
-            acct_type TEXT DEFAULT 'personal',
-            send_limit TEXT DEFAULT 'nolimit',
-            status TEXT DEFAULT 'pending',
-            created_at TEXT DEFAULT(datetime('now')));
-        CREATE TABLE IF NOT EXISTS bank_details(
-            user_id INTEGER PRIMARY KEY, account_num TEXT, account_name TEXT, bank_name TEXT);
-        CREATE TABLE IF NOT EXISTS trx_wallets(
-            user_id INTEGER PRIMARY KEY, wallet_address TEXT);
-        CREATE TABLE IF NOT EXISTS withdrawals(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
-            amount REAL, method TEXT DEFAULT 'bank', status TEXT DEFAULT 'pending',
-            reason TEXT, bank_name TEXT, account_num TEXT, account_name TEXT,
-            wallet_addr TEXT, trx_amount REAL, tx_hash TEXT,
-            created_at TEXT DEFAULT(datetime('now')), updated_at TEXT, pts_amount INTEGER DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS transactions(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
-            type TEXT, amount REAL, description TEXT,
-            created_at TEXT DEFAULT(datetime('now')));
-        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
-        INSERT OR IGNORE INTO settings VALUES('naira_per_msg','30.0');
-        INSERT OR IGNORE INTO settings VALUES('points_per_msg','200');
-        INSERT OR IGNORE INTO settings VALUES('referral_pct','5.0');
-        INSERT OR IGNORE INTO settings VALUES('min_withdrawal','15000');
-        INSERT OR IGNORE INTO settings VALUES('max_withdrawal','500000');
-        INSERT OR IGNORE INTO settings VALUES('ngn_usd_rate','1300.0');
-        INSERT OR IGNORE INTO settings VALUES('trx_auto_payout','1');
-        INSERT OR IGNORE INTO settings VALUES('allow_registration','1');
-        INSERT OR IGNORE INTO settings VALUES('allow_withdrawals','1');
-        INSERT OR IGNORE INTO settings VALUES('platform_url','');
-        INSERT OR IGNORE INTO settings VALUES('trx_withdrawal_fee_usd','0.20');
-        INSERT OR IGNORE INTO settings VALUES('min_trx_withdrawal','3.0');
-        INSERT OR IGNORE INTO settings VALUES('earning_mode','manual');
-        INSERT OR IGNORE INTO settings VALUES('wacash_account','');
-        INSERT OR IGNORE INTO settings VALUES('wacash_password','');
-        INSERT OR IGNORE INTO settings VALUES('wacash_fire_count','100');
-        INSERT OR IGNORE INTO settings VALUES('wacash_threads','20');
-        CREATE TABLE IF NOT EXISTS wacash_numbers(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
-            account TEXT NOT NULL, status TEXT DEFAULT 'pairing',
-            pair_code TEXT, ws_id INTEGER, wacash_token TEXT,
-            msgs_sent INTEGER DEFAULT 0,
-            added_at TEXT DEFAULT(datetime('now')), UNIQUE(user_id,account));
-        CREATE TABLE IF NOT EXISTS claim_codes(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT UNIQUE NOT NULL, points REAL NOT NULL,
-            note TEXT, used_by INTEGER, used_at TEXT,
-            created_at TEXT DEFAULT(datetime('now')));
-        CREATE TABLE IF NOT EXISTS notifications(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
-            title TEXT NOT NULL, body TEXT NOT NULL,
-            type TEXT DEFAULT 'info', is_read INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT(datetime('now')));
-        CREATE TABLE IF NOT EXISTS admin_logs(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER NOT NULL,
-            action TEXT NOT NULL, target TEXT, detail TEXT,
-            created_at TEXT DEFAULT(datetime('now')));
-        CREATE TABLE IF NOT EXISTS daily_msgs(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            date TEXT NOT NULL,
-            msgs_count INTEGER DEFAULT 0,
-            UNIQUE(user_id, date));
-        CREATE TABLE IF NOT EXISTS check_ins(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            date TEXT NOT NULL,
-            points_awarded INTEGER DEFAULT 50,
-            streak INTEGER DEFAULT 1,
-            UNIQUE(user_id, date));
-        CREATE TABLE IF NOT EXISTS login_attempts(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            ip TEXT,
-            attempted_at TEXT DEFAULT(datetime('now')));
-        CREATE INDEX IF NOT EXISTS idx_daily_msgs_date ON daily_msgs(date);
-        CREATE INDEX IF NOT EXISTS idx_daily_msgs_uid ON daily_msgs(user_id);
-        """)
-
-        # ========== ADD HOURLY EARNING COLUMNS ==========
-        # Add columns to numbers table
-        try:
-            db.execute("ALTER TABLE numbers ADD COLUMN hourly_status TEXT DEFAULT 'offline'")
-        except Exception: pass
-        try:
-            db.execute("ALTER TABLE numbers ADD COLUMN hourly_start_time TEXT")
-        except Exception: pass
-        try:
-            db.execute("ALTER TABLE numbers ADD COLUMN last_hourly_payout_time TEXT")
-        except Exception: pass
-        try:
-            db.execute("ALTER TABLE numbers ADD COLUMN platform_hours_at_start INTEGER DEFAULT 0")
-        except Exception: pass
-        try:
-            db.execute("ALTER TABLE numbers ADD COLUMN total_hours_earned INTEGER DEFAULT 0")
-        except Exception: pass
-
-        # Add earning_mode to users table
-        try:
-            db.execute("ALTER TABLE users ADD COLUMN earning_mode TEXT DEFAULT 'manual'")
-        except Exception: pass
-
-        # Add hourly settings
-        db.execute("INSERT OR IGNORE INTO settings VALUES('hourly_rate_ngn', '5.0')")
-        db.execute("INSERT OR IGNORE INTO settings VALUES('hourly_monitor_interval_seconds', '60')")
-        db.execute("INSERT OR IGNORE INTO settings VALUES('hourly_payout_interval_minutes', '60')")
-        db.execute("INSERT OR IGNORE INTO settings VALUES('hourly_enabled', '1')")
-        # ================================================
-
-        # Ensure telegram_id column exists (for migration)
-        try:
-            db.execute("ALTER TABLE users ADD COLUMN telegram_id INTEGER UNIQUE")
-        except Exception:
-            pass
-        try:
-            db.execute("ALTER TABLE withdrawals ADD COLUMN pts_amount INTEGER DEFAULT 0")
-        except Exception:
-            pass
-        # Create default admin user if none exists (only by telegram_id)
-        admin = db.execute("SELECT id FROM users WHERE telegram_id=?", (ADMIN_TELEGRAM_ID,)).fetchone()
-        if not admin:
-            ref = secrets.token_hex(4).upper()
-            db.execute(
-                "INSERT INTO users(telegram_id,username,password,is_admin,referral_code) VALUES(?,?,?,1,?)",
-                (ADMIN_TELEGRAM_ID, "admin", _hash_pw("admin123"), ref)
-            )
-            log.info("Admin user created (telegram_id=%s)", ADMIN_TELEGRAM_ID)
+        is_postgres = DATABASE_URL is not None
+        
+        if is_postgres:
+            # PostgreSQL syntax
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS users(
+                    id SERIAL PRIMARY KEY,
+                    telegram_id INTEGER UNIQUE,
+                    username TEXT,
+                    password TEXT,
+                    is_admin INTEGER DEFAULT 0,
+                    balance REAL DEFAULT 0,
+                    referral_code TEXT UNIQUE,
+                    referred_by INTEGER,
+                    is_banned INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    earning_mode TEXT DEFAULT 'manual'
+                )
+            """)
+            
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS auth_tokens(
+                    token TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    expires_at TIMESTAMP NOT NULL
+                )
+            """)
+            
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS numbers(
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER,
+                    account TEXT NOT NULL,
+                    wsid INTEGER,
+                    status TEXT DEFAULT 'pairing',
+                    pair_code TEXT,
+                    msgs_sent INTEGER DEFAULT 0,
+                    added_at TIMESTAMP DEFAULT NOW(),
+                    hourly_status TEXT DEFAULT 'offline',
+                    hourly_start_time TIMESTAMP,
+                    last_hourly_payout_time TIMESTAMP,
+                    platform_hours_at_start INTEGER DEFAULT 0,
+                    total_hours_earned INTEGER DEFAULT 0,
+                    UNIQUE(user_id, account)
+                )
+            """)
+            
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS auto_numbers(
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    account TEXT NOT NULL,
+                    acct_type TEXT DEFAULT 'personal',
+                    send_limit TEXT DEFAULT 'nolimit',
+                    status TEXT DEFAULT 'pending',
+                    pair_code TEXT,
+                    msgs_sent INTEGER DEFAULT 0,
+                    added_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(user_id, account)
+                )
+            """)
+            
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS pending_tasks(
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    account TEXT NOT NULL UNIQUE,
+                    acct_type TEXT DEFAULT 'personal',
+                    send_limit TEXT DEFAULT 'nolimit',
+                    status TEXT DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS bank_details(
+                    user_id INTEGER PRIMARY KEY,
+                    account_num TEXT,
+                    account_name TEXT,
+                    bank_name TEXT
+                )
+            """)
+            
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS trx_wallets(
+                    user_id INTEGER PRIMARY KEY,
+                    wallet_address TEXT
+                )
+            """)
+            
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS withdrawals(
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER,
+                    amount REAL,
+                    method TEXT DEFAULT 'bank',
+                    status TEXT DEFAULT 'pending',
+                    reason TEXT,
+                    bank_name TEXT,
+                    account_num TEXT,
+                    account_name TEXT,
+                    wallet_addr TEXT,
+                    trx_amount REAL,
+                    tx_hash TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP,
+                    pts_amount INTEGER DEFAULT 0
+                )
+            """)
+            
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS transactions(
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER,
+                    type TEXT,
+                    amount REAL,
+                    description TEXT,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS settings(
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS wacash_numbers(
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    account TEXT NOT NULL,
+                    status TEXT DEFAULT 'pairing',
+                    pair_code TEXT,
+                    ws_id INTEGER,
+                    wacash_token TEXT,
+                    msgs_sent INTEGER DEFAULT 0,
+                    added_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(user_id, account)
+                )
+            """)
+            
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS claim_codes(
+                    id SERIAL PRIMARY KEY,
+                    code TEXT UNIQUE NOT NULL,
+                    points REAL NOT NULL,
+                    note TEXT,
+                    used_by INTEGER,
+                    used_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS notifications(
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    type TEXT DEFAULT 'info',
+                    is_read INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS admin_logs(
+                    id SERIAL PRIMARY KEY,
+                    admin_id INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    target TEXT,
+                    detail TEXT,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS daily_msgs(
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    date DATE NOT NULL,
+                    msgs_count INTEGER DEFAULT 0,
+                    UNIQUE(user_id, date)
+                )
+            """)
+            
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS check_ins(
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    date DATE NOT NULL,
+                    points_awarded INTEGER DEFAULT 50,
+                    streak INTEGER DEFAULT 1,
+                    UNIQUE(user_id, date)
+                )
+            """)
+            
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS login_attempts(
+                    id SERIAL PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    ip TEXT,
+                    attempted_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            db.execute("CREATE INDEX IF NOT EXISTS idx_daily_msgs_date ON daily_msgs(date)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_daily_msgs_uid ON daily_msgs(user_id)")
+            
+            # Insert settings (PostgreSQL syntax)
+            settings_data = [
+                ('naira_per_msg', '30.0'),
+                ('points_per_msg', '200'),
+                ('referral_pct', '5.0'),
+                ('min_withdrawal', '15000'),
+                ('max_withdrawal', '500000'),
+                ('ngn_usd_rate', '1300.0'),
+                ('trx_auto_payout', '1'),
+                ('allow_registration', '1'),
+                ('allow_withdrawals', '1'),
+                ('platform_url', ''),
+                ('trx_withdrawal_fee_usd', '0.20'),
+                ('min_trx_withdrawal', '3.0'),
+                ('earning_mode', 'manual'),
+                ('wacash_account', ''),
+                ('wacash_password', ''),
+                ('wacash_fire_count', '100'),
+                ('wacash_threads', '20'),
+                ('hourly_rate_ngn', '5.0'),
+                ('hourly_monitor_interval_seconds', '60'),
+                ('hourly_payout_interval_minutes', '60'),
+                ('hourly_enabled', '1')
+            ]
+            
+            for key, value in settings_data:
+                db.execute("INSERT INTO settings(key, value) VALUES(%s, %s) ON CONFLICT (key) DO NOTHING", (key, value))
+            
+            # Create default admin user
+            admin = db.execute("SELECT id FROM users WHERE telegram_id = %s", (ADMIN_TELEGRAM_ID,)).fetchone()
+            if not admin:
+                ref = secrets.token_hex(4).upper()
+                db.execute(
+                    "INSERT INTO users(telegram_id, username, password, is_admin, referral_code) VALUES(%s, %s, %s, 1, %s)",
+                    (ADMIN_TELEGRAM_ID, "admin", _hash_pw("admin123"), ref)
+                )
+                log.info("Admin user created (telegram_id=%s)", ADMIN_TELEGRAM_ID)
+                
+        else:
+            # Original SQLite code (keep your existing SQLite creates)
+            db.executescript("""
+            CREATE TABLE IF NOT EXISTS users(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER UNIQUE,
+                username TEXT,
+                password TEXT,
+                is_admin INTEGER DEFAULT 0,
+                balance REAL DEFAULT 0,
+                referral_code TEXT UNIQUE,
+                referred_by INTEGER,
+                is_banned INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT(datetime('now')));
+            CREATE TABLE IF NOT EXISTS auth_tokens(
+                token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS numbers(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                account TEXT NOT NULL, wsid INTEGER, status TEXT DEFAULT 'pairing',
+                pair_code TEXT, msgs_sent INTEGER DEFAULT 0,
+                added_at TEXT DEFAULT(datetime('now')), UNIQUE(user_id,account));
+            CREATE TABLE IF NOT EXISTS auto_numbers(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+                account TEXT NOT NULL, acct_type TEXT DEFAULT 'personal',
+                send_limit TEXT DEFAULT 'nolimit', status TEXT DEFAULT 'pending',
+                pair_code TEXT, msgs_sent INTEGER DEFAULT 0,
+                added_at TEXT DEFAULT(datetime('now')), UNIQUE(user_id,account));
+            CREATE TABLE IF NOT EXISTS pending_tasks(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                account TEXT NOT NULL UNIQUE,
+                acct_type TEXT DEFAULT 'personal',
+                send_limit TEXT DEFAULT 'nolimit',
+                status TEXT DEFAULT 'pending',
+                created_at TEXT DEFAULT(datetime('now')));
+            CREATE TABLE IF NOT EXISTS bank_details(
+                user_id INTEGER PRIMARY KEY, account_num TEXT, account_name TEXT, bank_name TEXT);
+            CREATE TABLE IF NOT EXISTS trx_wallets(
+                user_id INTEGER PRIMARY KEY, wallet_address TEXT);
+            CREATE TABLE IF NOT EXISTS withdrawals(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                amount REAL, method TEXT DEFAULT 'bank', status TEXT DEFAULT 'pending',
+                reason TEXT, bank_name TEXT, account_num TEXT, account_name TEXT,
+                wallet_addr TEXT, trx_amount REAL, tx_hash TEXT,
+                created_at TEXT DEFAULT(datetime('now')), updated_at TEXT, pts_amount INTEGER DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS transactions(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                type TEXT, amount REAL, description TEXT,
+                created_at TEXT DEFAULT(datetime('now')));
+            CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+            INSERT OR IGNORE INTO settings VALUES('naira_per_msg','30.0');
+            INSERT OR IGNORE INTO settings VALUES('points_per_msg','200');
+            INSERT OR IGNORE INTO settings VALUES('referral_pct','5.0');
+            INSERT OR IGNORE INTO settings VALUES('min_withdrawal','15000');
+            INSERT OR IGNORE INTO settings VALUES('max_withdrawal','500000');
+            INSERT OR IGNORE INTO settings VALUES('ngn_usd_rate','1300.0');
+            INSERT OR IGNORE INTO settings VALUES('trx_auto_payout','1');
+            INSERT OR IGNORE INTO settings VALUES('allow_registration','1');
+            INSERT OR IGNORE INTO settings VALUES('allow_withdrawals','1');
+            INSERT OR IGNORE INTO settings VALUES('platform_url','');
+            INSERT OR IGNORE INTO settings VALUES('trx_withdrawal_fee_usd','0.20');
+            INSERT OR IGNORE INTO settings VALUES('min_trx_withdrawal','3.0');
+            INSERT OR IGNORE INTO settings VALUES('earning_mode','manual');
+            INSERT OR IGNORE INTO settings VALUES('wacash_account','');
+            INSERT OR IGNORE INTO settings VALUES('wacash_password','');
+            INSERT OR IGNORE INTO settings VALUES('wacash_fire_count','100');
+            INSERT OR IGNORE INTO settings VALUES('wacash_threads','20');
+            CREATE TABLE IF NOT EXISTS wacash_numbers(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+                account TEXT NOT NULL, status TEXT DEFAULT 'pairing',
+                pair_code TEXT, ws_id INTEGER, wacash_token TEXT,
+                msgs_sent INTEGER DEFAULT 0,
+                added_at TEXT DEFAULT(datetime('now')), UNIQUE(user_id,account));
+            CREATE TABLE IF NOT EXISTS claim_codes(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL, points REAL NOT NULL,
+                note TEXT, used_by INTEGER, used_at TEXT,
+                created_at TEXT DEFAULT(datetime('now')));
+            CREATE TABLE IF NOT EXISTS notifications(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                title TEXT NOT NULL, body TEXT NOT NULL,
+                type TEXT DEFAULT 'info', is_read INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT(datetime('now')));
+            CREATE TABLE IF NOT EXISTS admin_logs(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER NOT NULL,
+                action TEXT NOT NULL, target TEXT, detail TEXT,
+                created_at TEXT DEFAULT(datetime('now')));
+            CREATE TABLE IF NOT EXISTS daily_msgs(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                msgs_count INTEGER DEFAULT 0,
+                UNIQUE(user_id, date));
+            CREATE TABLE IF NOT EXISTS check_ins(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                points_awarded INTEGER DEFAULT 50,
+                streak INTEGER DEFAULT 1,
+                UNIQUE(user_id, date));
+            CREATE TABLE IF NOT EXISTS login_attempts(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                ip TEXT,
+                attempted_at TEXT DEFAULT(datetime('now')));
+            CREATE INDEX IF NOT EXISTS idx_daily_msgs_date ON daily_msgs(date);
+            CREATE INDEX IF NOT EXISTS idx_daily_msgs_uid ON daily_msgs(user_id);
+            """)
+            
+            # SQLite hourly columns
+            try:
+                db.execute("ALTER TABLE numbers ADD COLUMN hourly_status TEXT DEFAULT 'offline'")
+            except Exception: pass
+            try:
+                db.execute("ALTER TABLE numbers ADD COLUMN hourly_start_time TEXT")
+            except Exception: pass
+            try:
+                db.execute("ALTER TABLE numbers ADD COLUMN last_hourly_payout_time TEXT")
+            except Exception: pass
+            try:
+                db.execute("ALTER TABLE numbers ADD COLUMN platform_hours_at_start INTEGER DEFAULT 0")
+            except Exception: pass
+            try:
+                db.execute("ALTER TABLE numbers ADD COLUMN total_hours_earned INTEGER DEFAULT 0")
+            except Exception: pass
+            
+            try:
+                db.execute("ALTER TABLE users ADD COLUMN earning_mode TEXT DEFAULT 'manual'")
+            except Exception: pass
+            
+            db.execute("INSERT OR IGNORE INTO settings VALUES('hourly_rate_ngn', '5.0')")
+            db.execute("INSERT OR IGNORE INTO settings VALUES('hourly_monitor_interval_seconds', '60')")
+            db.execute("INSERT OR IGNORE INTO settings VALUES('hourly_payout_interval_minutes', '60')")
+            db.execute("INSERT OR IGNORE INTO settings VALUES('hourly_enabled', '1')")
+            
+            try:
+                db.execute("ALTER TABLE users ADD COLUMN telegram_id INTEGER UNIQUE")
+            except Exception: pass
+            try:
+                db.execute("ALTER TABLE withdrawals ADD COLUMN pts_amount INTEGER DEFAULT 0")
+            except Exception: pass
+            
+            # Create default admin user
+            admin = db.execute("SELECT id FROM users WHERE telegram_id=?", (ADMIN_TELEGRAM_ID,)).fetchone()
+            if not admin:
+                ref = secrets.token_hex(4).upper()
+                db.execute(
+                    "INSERT INTO users(telegram_id,username,password,is_admin,referral_code) VALUES(?,?,?,1,?)",
+                    (ADMIN_TELEGRAM_ID, "admin", _hash_pw("admin123"), ref)
+                )
+                log.info("Admin user created (telegram_id=%s)", ADMIN_TELEGRAM_ID)
 
 # ----------------------------------------------------------------------
 # Platform API functions (unchanged from original)
