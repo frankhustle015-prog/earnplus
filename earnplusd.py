@@ -2861,7 +2861,8 @@ ADMIN_CREDIT_USER, ADMIN_BAN_USER, ADMIN_BROADCAST, ADMIN_SETTING_KEY, ADMIN_SET
 main_keyboard = ReplyKeyboardMarkup([
     ["💰 Dashboard", "➕ Add Number", "📞 My Numbers"],
     ["⚡ Hourly Status", "✉️ Send All", "🏆 Leaderboard"],
-    ["💸 Withdraw", "🔗 Referral", "⚙️ Settings"],
+    ["💸 Withdraw", "📜 Withdrawal History", "🔗 Referral"],
+    ["⚙️ Settings"]
 ], resize_keyboard=True)
 
 admin_extra_keyboard = ReplyKeyboardMarkup([
@@ -4453,17 +4454,87 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             text += f"{ban} `{r['username']}` – bal: {r['balance']:.0f} pts\n"
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_panel_markup)
 
-    elif data == "admin_withdrawals":
-        with get_db() as db:
-            wds = db.execute("SELECT w.id, u.username, w.amount, w.method, w.status, w.created_at FROM withdrawals w JOIN users u ON w.user_id=u.id WHERE w.status='pending' ORDER BY w.created_at ASC").fetchall()
-        if not wds:
-            await query.edit_message_text("No pending withdrawals.", reply_markup=admin_panel_markup)
+    elif text.startswith("/admin_withdraw"):
+    parts = text.split()
+    if len(parts) < 3:
+        await update.message.reply_text("Usage: /admin_withdraw <withdrawal_id> approve|reject [reason]\n\nExample: `/admin_withdraw 5 approve`\nGet withdrawal ID from Admin Panel → Withdrawals")
+        return
+    
+    try:
+        wd_id = int(parts[1])
+    except ValueError:
+        await update.message.reply_text("Invalid withdrawal ID. Please use a number.")
+        return
+    
+    action = parts[2].lower()
+    reason = " ".join(parts[3:]) if len(parts) > 3 else None
+    
+    if action not in ["approve", "reject"]:
+        await update.message.reply_text("Action must be 'approve' or 'reject'.")
+        return
+    
+    with get_db() as db:
+        # Get withdrawal details with user info
+        if DATABASE_URL:
+            wd = db.execute("""
+                SELECT w.*, u.username, u.telegram_id 
+                FROM withdrawals w 
+                JOIN users u ON w.user_id = u.id 
+                WHERE w.id = %s
+            """, (wd_id,)).fetchone()
+        else:
+            wd = db.execute("""
+                SELECT w.*, u.username, u.telegram_id 
+                FROM withdrawals w 
+                JOIN users u ON w.user_id = u.id 
+                WHERE w.id = ?
+            """, (wd_id,)).fetchone()
+        
+        if not wd:
+            await update.message.reply_text(f"❌ Withdrawal ID {wd_id} not found.")
             return
-        text = "⏳ *Pending Withdrawals*\n\n"
-        for w in wds:
-            text += f"ID: `{w['id']}` | {w['username']} | ₦{w['amount']:.2f} | {w['method']} | {w['created_at'][:10]}\n"
-        text += "\nTo approve/reject, use:\n/admin_withdraw <id> approve|reject [reason]"
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_panel_markup)
+        
+        if wd["status"] != "pending":
+            await update.message.reply_text(f"Withdrawal #{wd_id} is already {wd['status']}. Cannot change.")
+            return
+        
+        if action == "approve":
+            # Update withdrawal status
+            db.execute("UPDATE withdrawals SET status='approved', updated_at=CURRENT_TIMESTAMP WHERE id=?", (wd_id,))
+            _admin_log(db, get_internal_user_id(ADMIN_TELEGRAM_ID), "approve_withdrawal", f"WD#{wd_id}", 
+                      f"Amount: {wd['pts_amount']} pts for user {wd['username']}")
+            
+            # Notify user
+            await send_telegram(
+                wd["telegram_id"],
+                f"✅ *Withdrawal Approved!*\n\n"
+                f"💰 Amount: `{wd['pts_amount']:,}` points\n"
+                f"💵 ≈ ₦{wd['amount']:.2f}\n"
+                f"📅 Approved: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+                f"Your funds will be sent to your registered account shortly.",
+                parse_mode="Markdown"
+            )
+            await update.message.reply_text(f"✅ Withdrawal #{wd_id} approved for {wd['username']} ({wd['pts_amount']} points)")
+            
+        else:  # reject
+            # Update withdrawal status and refund points
+            db.execute("UPDATE withdrawals SET status='rejected', reason=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", 
+                      (reason or "No reason provided", wd_id))
+            _credit(db, wd["user_id"], wd["pts_amount"], f"Refund for rejected withdrawal #{wd_id}")
+            _admin_log(db, get_internal_user_id(ADMIN_TELEGRAM_ID), "reject_withdrawal", f"WD#{wd_id}", 
+                      f"Reason: {reason or 'No reason'} for user {wd['username']}")
+            
+            # Notify user
+            await send_telegram(
+                wd["telegram_id"],
+                f"❌ *Withdrawal Rejected*\n\n"
+                f"💰 Amount: `{wd['pts_amount']:,}` points\n"
+                f"💵 ≈ ₦{wd['amount']:.2f}\n"
+                f"📝 Reason: {reason or 'Not specified'}\n\n"
+                f"Your points have been refunded to your balance.",
+                parse_mode="Markdown"
+            )
+            await update.message.reply_text(f"❌ Withdrawal #{wd_id} rejected for {wd['username']}. Points refunded.")
 
     elif data == "admin_credit":
         await query.edit_message_text("Send the command: `/credit_user <user_id> <points>`\n(You can get user_id from /admin_users)",
@@ -5222,6 +5293,95 @@ async def stop_spinner(context: ContextTypes.DEFAULT_TYPE,
     context.user_data.pop("spinner_chat_id", None)
     context.user_data.pop("spinner_text", None)
     
+async def withdrawal_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show user's withdrawal history (pending and approved/rejected)"""
+    telegram_id = update.effective_user.id
+    uid = get_internal_user_id(telegram_id)
+    
+    if not uid:
+        await update.message.reply_text("Please use /start to register before proceeding.")
+        return
+    
+    # Show spinner
+    await show_spinner(update, context, "📜 Fetching withdrawal history...")
+    
+    with get_db() as db:
+        if DATABASE_URL:
+            withdrawals = db.execute("""
+                SELECT id, amount, method, status, reason, 
+                       pts_amount, created_at, updated_at
+                FROM withdrawals 
+                WHERE user_id = %s 
+                ORDER BY created_at DESC
+                LIMIT 50
+            """, (uid,)).fetchall()
+        else:
+            withdrawals = db.execute("""
+                SELECT id, amount, method, status, reason, 
+                       pts_amount, created_at, updated_at
+                FROM withdrawals 
+                WHERE user_id = ? 
+                ORDER BY created_at DESC
+                LIMIT 50
+            """, (uid,)).fetchall()
+    
+    if not withdrawals:
+        await stop_spinner(context, "📭 *No Withdrawal History*\n\nYou haven't made any withdrawal requests yet.\n\nUse *💸 Withdraw* to request your first withdrawal!", success=False, parse_mode="Markdown")
+        return
+    
+    # Build message
+    text = "📜 *WITHDRAWAL HISTORY*\n"
+    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    pending_count = 0
+    approved_count = 0
+    rejected_count = 0
+    total_approved = 0
+    
+    for w in withdrawals:
+        status = w["status"]
+        pts = int(w["pts_amount"] or 0)
+        amount = float(w["amount"] or 0)
+        method = w["method"] or "bank"
+        created = w["created_at"][:16] if w["created_at"] else "Unknown"
+        
+        # Count stats
+        if status == "pending":
+            pending_count += 1
+            status_emoji = "⏳"
+            status_text = "PENDING"
+        elif status == "approved" or status == "done":
+            approved_count += 1
+            total_approved += amount
+            status_emoji = "✅"
+            status_text = "APPROVED"
+        else:
+            rejected_count += 1
+            status_emoji = "❌"
+            status_text = "REJECTED"
+        
+        text += f"{status_emoji} *WD#{w['id']}* - {status_text}\n"
+        text += f"   📅 {created}\n"
+        text += f"   💰 {pts:,} pts (≈ ₦{amount:.2f})\n"
+        text += f"   🏦 Method: {method.upper()}\n"
+        
+        if status == "rejected" and w["reason"]:
+            text += f"   📝 Reason: {w['reason']}\n"
+        if status == "approved" or status == "done":
+            updated = w["updated_at"][:16] if w["updated_at"] else "Unknown"
+            text += f"   ✅ Approved: {updated}\n"
+        
+        text += "\n"
+    
+    text += "━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"📊 *Summary*\n"
+    text += f"⏳ Pending: {pending_count}\n"
+    text += f"✅ Approved: {approved_count} (≈ ₦{total_approved:.2f})\n"
+    text += f"❌ Rejected: {rejected_count}\n\n"
+    text += "_💡 Withdrawals typically process within 1-3 business days._"
+    
+    await stop_spinner(context, text, success=True, parse_mode="Markdown")
+    
 async def debug_env(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Check environment variables (admin only)"""
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
@@ -5373,6 +5533,7 @@ def main():
     application.add_handler(MessageHandler(filters.Regex("^🏆 Leaderboard$"), leaderboard))
     application.add_handler(MessageHandler(filters.Regex("^🎁 Check-in$"), check_in))
     application.add_handler(withdraw_conv)
+    application.add_handler(MessageHandler(filters.Regex("^📜 Withdrawal History$"), withdrawal_history))  # <-- ADD THIS LINE
     application.add_handler(MessageHandler(filters.Regex("^🔗 Referral$"), referral))
     application.add_handler(MessageHandler(filters.Regex("^⚙️ Settings$"), settings_menu))
     application.add_handler(MessageHandler(filters.Regex("^👑 Admin Panel$"), lambda u,c: u.message.reply_text("Admin Panel:", reply_markup=admin_panel_markup)))
