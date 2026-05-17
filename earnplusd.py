@@ -28,7 +28,6 @@ import sqlite3
 import secrets
 import hashlib
 import threading
-import random
 import time
 import re
 import psycopg2
@@ -846,51 +845,24 @@ def api_check_pairing_status(task_id: str) -> tuple[int | None, str | None]:
     except Exception as e:
         return None, str(e)
         
-# ===================== TASK4U API FUNCTIONS (UPDATED) =====================
-
+# ----------------------------------------------------------------------
+# Task4U API functions for hourly mode (separate platform)
+# ----------------------------------------------------------------------
 def task4u_login() -> bool:
-    """Login to Task4U platform with Cloudflare bypass."""
+    """Login to Task4U platform and store token."""
     global task4u_session
     with task4u_lock:
-        # Try cloudscraper first, fallback to requests
-        try:
-            import cloudscraper
-            http = cloudscraper.create_scraper(
-                browser={
-                    'browser': 'chrome',
-                    'platform': 'android',
-                    'desktop': False,
-                    'mobile': True
-                },
-                delay=15,
-                interpreter='nodejs'  # Helps with Cloudflare
-            )
-            log.info("[Task4U] Using cloudscraper for Cloudflare bypass")
-        except ImportError:
-            log.warning("[Task4U] cloudscraper not installed, falling back to requests")
-            http = requests.Session()
-            # Add requests adapters for better connection handling
-            adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=3)
-            http.mount('http://', adapter)
-            http.mount('https://', adapter)
+        # Create a new session
+        http = requests.Session()
         
-        # Realistic mobile headers
+        # EXACT headers from working curl command (no extra headers)
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Linux; Android 14; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13; V2116 Build/TP1A.220624.014_NONFC) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.7727.138 Mobile Safari/537.36",
             "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
             "Origin": "https://taskm4u.com",
             "Referer": "https://taskm4u.com/",
-            "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-            "Sec-Ch-Ua-Mobile": "?1",
-            "Sec-Ch-Ua-Platform": "Android",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-site",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache"
+            "x-requested-with": "mark.via.gp",
         }
         
         payload = {
@@ -898,144 +870,69 @@ def task4u_login() -> bool:
             "pwd": TASK4U_PASS_HASH,
             "autologin": True,
             "lang": "",
-            "device": "android",
+            "device": "",
             "mac": "",
             "httpRequestIndex": 0,
-            "httpRequestCount": 1,
-            "version": "1.0.0",
-            "platform": "android"
+            "httpRequestCount": 0
         }
         
-        # Retry logic with backoff
-        for attempt in range(1, 4):
-            try:
-                log.info(f"[Task4U] Login attempt {attempt}/3")
-                
-                # Add delay between attempts (except first)
-                if attempt > 1:
-                    delay = attempt * 3
-                    log.info(f"[Task4U] Waiting {delay}s before retry...")
-                    time.sleep(delay)
-                
-                # Execute request
-                r = http.post(
-                    f"{TASK4U_BASE_URL}/login/login",
-                    json=payload,
-                    headers=headers,
-                    timeout=60,
-                    verify=True
-                )
-                
-                log.info(f"[Task4U] Response status: {r.status_code}")
-                
-                # Handle Cloudflare block
+        try:
+            log.info(f"[Task4U] Attempting login for user {TASK4U_USER}")
+            r = http.post(
+                f"{TASK4U_BASE_URL}/login/login",
+                json=payload,
+                headers=headers,
+                timeout=45
+            )
+            
+            log.info(f"[Task4U] Login response status: {r.status_code}")
+            
+            if r.status_code != 200:
+                log.error(f"[Task4U] Login failed with status {r.status_code}")
+                log.error(f"[Task4U] Response body: {r.text[:500]}")
                 if r.status_code == 403:
-                    log.error(f"[Task4U] Cloudflare block detected (attempt {attempt}/3)")
-                    
-                    # Try to get the Cloudflare challenge page info
-                    if 'cf-browser-verification' in r.text or 'cloudflare' in r.text.lower():
-                        log.error("[Task4U] Cloudflare browser verification required")
-                        
-                        # If we have cloudscraper, it should handle this
-                        if 'cloudscraper' in str(type(http)):
-                            log.info("[Task4U] cloudscraper active, should bypass Cloudflare")
-                        else:
-                            log.error("[Task4U] Install cloudscraper: pip install cloudscraper")
-                    
-                    if attempt < 3:
-                        continue
-                    else:
-                        # Disable hourly mode on final failure
-                        log.error("[Task4U] All login attempts failed due to Cloudflare")
-                        set_setting("hourly_enabled", "0")
-                        return False
+                    log.error("[Task4U] Cloudflare blocking - server IP may be blocked")
+                return False
+            
+            # Try to parse JSON
+            try:
+                d = r.json()
+            except Exception as json_err:
+                log.error(f"[Task4U] Failed to parse JSON response: {json_err}")
+                log.error(f"[Task4U] Raw response (first 500 chars): {r.text[:500]}")
+                return False
+            
+            if d.get("code") == 0 and d.get("data", {}).get("token"):
+                task4u_session = {
+                    "token": d["data"]["token"],
+                    "uid": d["data"]["uid"],
+                    "http": http
+                }
+                log.info(f"[Task4U] Login OK, uid={d['data']['uid']}")
+                return True
+            else:
+                log.error(f"[Task4U] Login failed: {d.get('msg', 'Unknown error')}")
+                return False
                 
-                if r.status_code != 200:
-                    log.error(f"[Task4U] Unexpected status code: {r.status_code}")
-                    continue
-                
-                # Parse JSON response
-                try:
-                    d = r.json()
-                except Exception as json_err:
-                    log.error(f"[Task4U] JSON decode error: {json_err}")
-                    log.debug(f"[Task4U] Raw response: {r.text[:500]}")
-                    continue
-                
-                # Check response
-                if d.get("code") == 0 and d.get("data", {}).get("token"):
-                    token = d["data"]["token"]
-                    uid = d["data"]["uid"]
-                    
-                    task4u_session = {
-                        "token": token,
-                        "uid": uid,
-                        "http": http,
-                        "login_time": time.time()
-                    }
-                    log.info(f"[Task4U] ✅ Login successful! uid={uid}")
-                    log.info(f"[Task4U] Token: {token[:20]}...")
-                    
-                    # Test the token with a simple API call
-                    test_r = http.post(
-                        f"{TASK4U_BASE_URL}/taskhosting/page?token={token}",
-                        json={"page": 1, "limit": 1},
-                        headers=_task4u_headers(),
-                        timeout=30
-                    )
-                    if test_r.status_code == 200:
-                        log.info("[Task4U] Token verified - API accessible")
-                    else:
-                        log.warning(f"[Task4U] Token test returned {test_r.status_code}")
-                    
-                    return True
-                else:
-                    error_msg = d.get('msg', d.get('message', 'Unknown error'))
-                    log.error(f"[Task4U] Login API error: code={d.get('code')}, msg={error_msg}")
-                    
-                    # Special error handling
-                    if d.get('code') == 30000:
-                        log.error("[Task4U] Account may be locked or requires verification")
-                    
-            except requests.exceptions.Timeout:
-                log.error(f"[Task4U] Request timeout (attempt {attempt}/3)")
-                if attempt == 3:
-                    log.error("[Task4U] All attempts timed out - network issue?")
-                    return False
-                    
-            except requests.exceptions.ConnectionError as e:
-                log.error(f"[Task4U] Connection error: {e}")
-                if attempt == 3:
-                    return False
-                    
-            except Exception as e:
-                log.error(f"[Task4U] Unexpected error: {e}")
-                import traceback
-                log.debug(traceback.format_exc())
-                if attempt == 3:
-                    return False
-        
-        return False
+        except requests.exceptions.Timeout:
+            log.error("[Task4U] Login timeout - API is slow or unreachable")
+            return False
+        except requests.exceptions.ConnectionError as e:
+            log.error(f"[Task4U] Connection error: {e}")
+            return False
+        except Exception as e:
+            log.error(f"[Task4U] Login exception: {e}")
+            return False
 
 
 def _task4u_headers() -> dict:
     """Get headers for Task4U API calls with token."""
     return {
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Linux; Android 14; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13; V2116 Build/TP1A.220624.014_NONFC) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.7727.138 Mobile Safari/537.36",
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
         "Origin": "https://taskm4u.com",
         "Referer": "https://taskm4u.com/",
-        "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        "Sec-Ch-Ua-Mobile": "?1",
-        "Sec-Ch-Ua-Platform": "Android",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-site",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
         "x-requested-with": "mark.via.gp",
     }
 
@@ -1044,19 +941,15 @@ def _task4u_ps():
     """Get Task4U session, login if needed."""
     global task4u_session
     with task4u_lock:
-        # Check if session exists and token is not expired (assuming 24hr expiry)
         if not task4u_session.get("token") or not task4u_session.get("http"):
-            log.warning("[Task4U] Session missing — re-logging in...")
-            task4u_login()
-        elif task4u_session.get("login_time", 0) < time.time() - 82800:  # 23 hours
-            log.warning("[Task4U] Token may be expired — refreshing...")
+            log.warning("[Task4U] Session lost — re-logging in...")
             task4u_login()
         return dict(task4u_session)
 
 
 def task4u_get_pairing_code(account: str) -> tuple[str | None, str | None]:
     """
-    POST /task/getwswebcode with enhanced retry logic
+    POST /task/getwswebcode
     Returns (code, error_message)
     """
     s = _task4u_ps()
@@ -1064,94 +957,34 @@ def task4u_get_pairing_code(account: str) -> tuple[str | None, str | None]:
     if not token:
         return None, "Not logged in"
     
-    # Try multiple attempts with increasing delays
-    for attempt in range(1, 6):  # 5 attempts total
+    # Increase timeout and add more retries
+    for attempt in range(3):
         try:
-            log.info(f"[Task4U] Getting pairing code for {account} (attempt {attempt}/5)")
-            
-            # Add delay between attempts to avoid rate limiting
-            if attempt > 1:
-                delay = attempt * 2
-                log.info(f"[Task4U] Waiting {delay}s before retry...")
-                time.sleep(delay)
-            
-            # Make the API call
+            log.info(f"[Task4U] Attempt {attempt+1} to get pairing code for {account}")
             r = s["http"].post(
-                f"{TASK4U_BASE_URL}/task/getwswebcode",
-                params={"token": token},
+                f"{TASK4U_BASE_URL}/task/getwswebcode?token={token}",
                 json={"ws_account": account},
                 headers=_task4u_headers(),
-                timeout=45
+                timeout=45  # Increased from 15 to 30 seconds
             )
-            
-            log.info(f"[Task4U] getwswebcode response status: {r.status_code}")
-            
-            if r.status_code == 403:
-                log.warning(f"[Task4U] Cloudflare block on attempt {attempt}")
-                if attempt < 5:
-                    continue
-                return None, "Cloudflare is blocking the request"
-            
-            if r.status_code != 200:
-                log.warning(f"[Task4U] HTTP {r.status_code} on attempt {attempt}")
-                if attempt < 5:
-                    continue
-                return None, f"HTTP {r.status_code}"
-            
-            # Parse response
-            try:
-                d = r.json()
-            except Exception as json_err:
-                log.error(f"[Task4U] JSON parse error: {json_err}")
-                if attempt < 5:
-                    continue
-                return None, "Invalid response from server"
-            
-            log.info(f"[Task4U] API response: code={d.get('code')}, msg={d.get('msg', '')}")
-            
-            # Success - got pairing code
+            d = r.json()
+            log.info(f"[Task4U] getwswebcode response for {account}: {d}")
             if d.get("code") == 0 and d.get("data", {}).get("code"):
-                code = d["data"]["code"]
-                log.info(f"[Task4U] ✅ Got pairing code for {account}: {code}")
-                return code, None
-            
-            # Token expired - re-login and retry
+                return d["data"]["code"], None
+            # Check if token expired
             if d.get("code") in (401, 403) or "token" in str(d.get("msg", "")).lower():
-                log.warning("[Task4U] Token expired or invalid, re-logging...")
+                log.warning("[Task4U] Token expired, re-logging...")
                 task4u_login()
-                # Get fresh session and token
-                s = _task4u_ps()
-                token = s.get("token")
-                if token:
-                    continue
-                return None, "Authentication failed"
-            
-            # Rate limited - wait longer
-            if d.get("code") == 429 or "rate" in str(d.get("msg", "")).lower():
-                log.warning(f"[Task4U] Rate limited on attempt {attempt}")
-                time.sleep(attempt * 5)
-                continue
-            
-            # QR code generation failed (Cloudflare specific)
-            if d.get("code") == 30000:
-                log.warning(f"[Task4U] QR code generation failed (Cloudflare)")
-                if attempt == 5:
-                    return None, "QR code generation blocked by Cloudflare"
-                continue
-            
-            # Other API error
-            if attempt == 5:
-                return None, d.get("msg", f"Unknown error (code {d.get('code')})")
-            
+                return task4u_get_pairing_code(account)
+            return None, d.get("msg", "Unknown error")
         except requests.exceptions.Timeout:
-            log.warning(f"[Task4U] Timeout on attempt {attempt}/5")
-            if attempt == 5:
+            log.warning(f"[Task4U] Timeout on attempt {attempt+1}/3 for {account}")
+            if attempt == 2:  # Last attempt
                 return None, "Connection timeout - please try again"
             continue
-            
         except Exception as e:
-            log.error(f"[Task4U] Unexpected error: {e}")
-            if attempt == 5:
+            log.error(f"[Task4U] get_pairing_code error: {e}")
+            if attempt == 2:
                 return None, str(e)
             continue
     
@@ -1170,29 +1003,19 @@ def task4u_get_online_numbers() -> set:
     
     try:
         r = s["http"].post(
-            f"{TASK4U_BASE_URL}/taskhosting/page",
-            params={"token": token},
+            f"{TASK4U_BASE_URL}/taskhosting/page?token={token}",
             json={"page": 1, "limit": 100},
             headers=_task4u_headers(),
             timeout=15
         )
-        
-        if r.status_code != 200:
-            log.warning(f"[Task4U] get_online_numbers HTTP {r.status_code}")
-            return set()
-        
         d = r.json()
-        
         if d.get("code") == 0 and d.get("data", {}).get("data"):
             online = set()
             for item in d["data"]["data"]:
                 if item.get("status") == 1:  # 1 = online
                     online.add(item.get("ws_account"))
-            log.info(f"[Task4U] Found {len(online)} online numbers")
             return online
-        
         return set()
-        
     except Exception as e:
         log.error(f"[Task4U] get_online_numbers error: {e}")
         return set()
@@ -1209,43 +1032,20 @@ def task4u_get_hosting_time(account: str) -> int | None:
     
     try:
         r = s["http"].post(
-            f"{TASK4U_BASE_URL}/taskhosting/page",
-            params={"token": token},
+            f"{TASK4U_BASE_URL}/taskhosting/page?token={token}",
             json={"page": 1, "limit": 100},
             headers=_task4u_headers(),
             timeout=15
         )
-        
-        if r.status_code != 200:
-            return None
-        
         d = r.json()
-        
         if d.get("code") == 0 and d.get("data", {}).get("data"):
             for item in d["data"]["data"]:
                 if item.get("ws_account") == account:
-                    hosting_time = item.get("hosting_time", 0)
-                    log.debug(f"[Task4U] {account} hosting_time={hosting_time}")
-                    return hosting_time
-        
+                    return item.get("hosting_time", 0)
         return None
-        
     except Exception as e:
         log.error(f"[Task4U] get_hosting_time({account}) error: {e}")
         return None
-
-
-def task4u_check_health() -> bool:
-    """Check if Task4U API is accessible"""
-    try:
-        r = requests.get(
-            f"{TASK4U_BASE_URL}/health",
-            timeout=10,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        return r.status_code == 200
-    except:
-        return False
 
 # ----------------------------------------------------------------------
 # Workgo1 (wacash) API functions
