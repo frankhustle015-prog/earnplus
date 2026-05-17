@@ -4441,6 +4441,29 @@ async def stop_spinner(context: ContextTypes.DEFAULT_TYPE,
         pass
     context.user_data.pop("spinner_msg_id", None)
     context.user_data.pop("spinner_chat_id", None)
+    
+async def debug_env(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check environment variables (admin only)"""
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+    
+    railway_db = os.getenv("DATABASE_URL")
+    
+    message = f"🔍 **Environment Debug**\n\n"
+    message += f"DATABASE_URL found: {'✅ YES' if railway_db else '❌ NO'}\n"
+    
+    if railway_db:
+        message += f"Length: {len(railway_db)} chars\n"
+        message += f"Starts with: {railway_db[:30]}...\n"
+    else:
+        message += f"\n❌ DATABASE_URL is NOT set!\n\n"
+        message += f"Check your Railway variables:\n"
+        message += f"1. Go to Variables tab\n"
+        message += f"2. Look for DATABASE_URL\n"
+        message += f"3. If missing, add it manually"
+    
+    await update.message.reply_text(message, parse_mode="Markdown")
 
 async def update_spinner_message(msg, new_text: str):
     """Lightweight edit helper for messages outside the spinner system."""
@@ -4560,7 +4583,8 @@ def main():
     application.add_handler(CallbackQueryHandler(set_mode_callback, pattern="^set_mode_"))
     application.add_handler(MessageHandler(filters.Regex("^⚡ Hourly Status$"), hourly_status))
     application.add_handler(CommandHandler("fix_user_mode", fix_user_mode))
-    application.add_handler(CommandHandler("checkdb", check_db)) 
+    application.add_handler(CommandHandler("checkdb", check_db))
+    application.add_handler(CommandHandler("debugenv", debug_env))
 
     # Initialize database and start background tasks
     init_db()
