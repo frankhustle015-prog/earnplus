@@ -130,15 +130,25 @@ _wacash_fire_lock = threading.Lock()
 def get_db():
     if DATABASE_URL:
         # PostgreSQL for Railway
-        conn = psycopg2.connect(DATABASE_URL)
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        
+        conn = None
+        cur = None
         try:
-            yield conn
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+            yield cur  # Return cursor instead of connection
             conn.commit()
         except Exception:
-            conn.rollback()
+            if conn:
+                conn.rollback()
             raise
         finally:
-            conn.close()
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
     else:
         # SQLite for local testing
         conn = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -4245,16 +4255,19 @@ async def check_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_postgres = DATABASE_URL is not None
             
             if is_postgres:
-                result = db.execute("SELECT version() as ver").fetchone()
+                db.execute("SELECT version() as ver")
+                result = db.fetchone()
                 version = result['ver'][:50]
-                db_type = "PostgreSQL"
+                db_type = "PostgreSQL ✅"
             else:
-                result = db.execute("SELECT sqlite_version() as ver").fetchone()
+                db.execute("SELECT sqlite_version() as ver")
+                result = db.fetchone()
                 version = result['ver']
                 db_type = "SQLite (⚠️ Data will NOT persist!)"
             
-            # Count users to verify data persistence
-            user_count = db.execute("SELECT COUNT(*) as c FROM users").fetchone()['c']
+            # Count users
+            db.execute("SELECT COUNT(*) as c FROM users")
+            user_count = db.fetchone()['c']
             
             await update.message.reply_text(
                 f"✅ **Database Connected!**\n\n"
