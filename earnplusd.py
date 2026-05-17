@@ -4456,97 +4456,140 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_panel_markup)
 
     elif data == "admin_withdrawals":
-        with get_db() as db:
-            wds = db.execute("SELECT w.id, u.username, w.amount, w.method, w.status, w.created_at FROM withdrawals w JOIN users u ON w.user_id=u.id WHERE w.status='pending' ORDER BY w.created_at ASC").fetchall()
-        if not wds:
-            await query.edit_message_text("No pending withdrawals.", reply_markup=admin_panel_markup)
-            return
-        text = "⏳ *Pending Withdrawals*\n\n"
-        for w in wds:
-            # Handle datetime object correctly
-            created_at = w["created_at"]
-            if hasattr(created_at, 'strftime'):
-                created_str = created_at.strftime("%Y-%m-%d")
-            else:
-                created_str = str(created_at)[:10] if created_at else "Unknown"
-            text += f"ID: `{w['id']}` | {w['username']} | ₦{w['amount']:.2f} | {w['method']} | {created_str}\n"
-        text += "\nTo approve/reject, use:\n/admin_withdraw <id> approve|reject [reason]"
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_panel_markup)
+    with get_db() as db:
+        wds = db.execute("""
+            SELECT w.id, u.username, w.amount, w.method, w.status, w.created_at,
+                   b.account_num, b.account_name, b.bank_name, w.wallet_addr
+            FROM withdrawals w 
+            JOIN users u ON w.user_id = u.id
+            LEFT JOIN bank_details b ON u.id = b.user_id
+            WHERE w.status='pending' 
+            ORDER BY w.created_at ASC
+        """).fetchall()
+    
+    if not wds:
+        await query.edit_message_text("No pending withdrawals.", reply_markup=admin_panel_markup)
+        return
+    
+    text = "⏳ *PENDING WITHDRAWALS*\n"
+    text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    for w in wds:
+        # Handle datetime object correctly
+        created_at = w["created_at"]
+        if hasattr(created_at, 'strftime'):
+            created_str = created_at.strftime("%Y-%m-%d %H:%M")
+        else:
+            created_str = str(created_at)[:16] if created_at else "Unknown"
+        
+        text += f"*WD#{w['id']}* | {w['username']}\n"
+        text += f"   📅 {created_str}\n"
+        text += f"   💰 ₦{w['amount']:.2f} | {w['method'].upper()}\n"
+        
+        # Show bank details if bank transfer
+        if w["method"] == "bank":
+            text += f"   🏦 Bank: {w['bank_name'] or 'N/A'}\n"
+            text += f"   🔢 Account: {w['account_num'] or 'N/A'}\n"
+            text += f"   👤 Name: {w['account_name'] or 'N/A'}\n"
+        elif w["method"] == "trx" and w["wallet_addr"]:
+            text += f"   💎 TRX Wallet: {w['wallet_addr']}\n"
+        
+        text += "\n"
+    
+    text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"To approve/reject, use:\n"
+    text += f"`/admin_withdraw <id> approve|reject [reason]`\n\n"
+    text += f"Example: `/admin_withdraw 1 approve`"
+    
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_panel_markup)
         
     elif data == "admin_all_withdrawals":
-        with get_db() as db:
-            # Get all withdrawals with user info, ordered by most recent
-            if DATABASE_URL:
-                withdrawals = db.execute("""
-                    SELECT w.*, u.username, u.telegram_id 
-                    FROM withdrawals w 
-                    JOIN users u ON w.user_id = u.id 
-                    ORDER BY w.created_at DESC 
-                    LIMIT 100
-                """).fetchall()
-            else:
-                withdrawals = db.execute("""
-                    SELECT w.*, u.username, u.telegram_id 
-                    FROM withdrawals w 
-                    JOIN users u ON w.user_id = u.id 
-                    ORDER BY w.created_at DESC 
-                    LIMIT 100
-                """).fetchall()
+    with get_db() as db:
+        # Get all withdrawals with user info and bank details
+        if DATABASE_URL:
+            withdrawals = db.execute("""
+                SELECT w.*, u.username, u.telegram_id,
+                       b.account_num, b.account_name, b.bank_name
+                FROM withdrawals w 
+                JOIN users u ON w.user_id = u.id
+                LEFT JOIN bank_details b ON u.id = b.user_id
+                ORDER BY w.created_at DESC 
+                LIMIT 100
+            """).fetchall()
+        else:
+            withdrawals = db.execute("""
+                SELECT w.*, u.username, u.telegram_id,
+                       b.account_num, b.account_name, b.bank_name
+                FROM withdrawals w 
+                JOIN users u ON w.user_id = u.id
+                LEFT JOIN bank_details b ON u.id = b.user_id
+                ORDER BY w.created_at DESC 
+                LIMIT 100
+            """).fetchall()
+    
+    if not withdrawals:
+        await query.edit_message_text("No withdrawals found.", reply_markup=admin_panel_markup)
+        return
+    
+    # Build message
+    text = "📜 *ALL WITHDRAWALS (Last 100)*\n"
+    text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    pending_count = 0
+    approved_count = 0
+    rejected_count = 0
+    total_amount = 0
+    
+    for w in withdrawals:
+        status = w["status"]
+        pts = int(w["pts_amount"] or 0)
+        amount = float(w["amount"] or 0)
+        username = w["username"][:15] if w["username"] else "Unknown"
         
-        if not withdrawals:
-            await query.edit_message_text("No withdrawals found.", reply_markup=admin_panel_markup)
-            return
+        # Handle datetime object correctly
+        created_at = w["created_at"]
+        if hasattr(created_at, 'strftime'):
+            created_str = created_at.strftime("%Y-%m-%d %H:%M")
+        else:
+            created_str = str(created_at)[:16] if created_at else "Unknown"
         
-        # Build message
-        text = "📜 *ALL WITHDRAWALS (Last 100)*\n"
-        text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        if status == "pending":
+            pending_count += 1
+            status_emoji = "⏳"
+            status_text = "PENDING"
+        elif status in ["approved", "done"]:
+            approved_count += 1
+            total_amount += amount
+            status_emoji = "✅"
+            status_text = "APPROVED"
+        else:
+            rejected_count += 1
+            status_emoji = "❌"
+            status_text = "REJECTED"
         
-        pending_count = 0
-        approved_count = 0
-        rejected_count = 0
-        total_amount = 0
+        text += f"{status_emoji} *WD#{w['id']}* | {username}\n"
+        text += f"   📅 {created_str}\n"
+        text += f"   💰 {pts:,} pts (≈ ₦{amount:.2f})\n"
+        text += f"   📊 {status_text}\n"
         
-        for w in withdrawals:
-            status = w["status"]
-            pts = int(w["pts_amount"] or 0)
-            amount = float(w["amount"] or 0)
-            username = w["username"][:15] if w["username"] else "Unknown"
-            
-            # Handle datetime object correctly
-            created_at = w["created_at"]
-            if hasattr(created_at, 'strftime'):
-                created_str = created_at.strftime("%Y-%m-%d %H:%M")
-            else:
-                created_str = str(created_at)[:16] if created_at else "Unknown"
-            
-            if status == "pending":
-                pending_count += 1
-                status_emoji = "⏳"
-                status_text = "PENDING"
-            elif status in ["approved", "done"]:
-                approved_count += 1
-                total_amount += amount
-                status_emoji = "✅"
-                status_text = "APPROVED"
-            else:
-                rejected_count += 1
-                status_emoji = "❌"
-                status_text = "REJECTED"
-            
-            text += f"{status_emoji} *WD#{w['id']}* | {username}\n"
-            text += f"   📅 {created_str}\n"
-            text += f"   💰 {pts:,} pts (≈ ₦{amount:.2f})\n"
-            text += f"   📊 {status_text}\n"
-            text += "\n"
+        # Show bank details if available
+        if w["method"] == "bank" or w["bank_name"] or w["account_num"]:
+            text += f"   🏦 Bank: {w['bank_name'] or 'N/A'}\n"
+            text += f"   🔢 Account: {w['account_num'] or 'N/A'}\n"
+            text += f"   👤 Name: {w['account_name'] or 'N/A'}\n"
+        elif w["method"] == "trx" and w["wallet_addr"]:
+            text += f"   💎 TRX Wallet: {w['wallet_addr'][:20]}...\n"
         
-        text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        text += f"📊 *Summary*\n"
-        text += f"⏳ Pending: {pending_count}\n"
-        text += f"✅ Approved: {approved_count} (≈ ₦{total_amount:.2f})\n"
-        text += f"❌ Rejected: {rejected_count}\n\n"
-        text += "💡 *Tip:* Use `/admin_withdraw <id> approve|reject` to process pending withdrawals."
-        
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_panel_markup)
+        text += "\n"
+    
+    text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"📊 *Summary*\n"
+    text += f"⏳ Pending: {pending_count}\n"
+    text += f"✅ Approved: {approved_count} (≈ ₦{total_amount:.2f})\n"
+    text += f"❌ Rejected: {rejected_count}\n\n"
+    text += "💡 *Tip:* Use `/admin_withdraw <id> approve|reject` to process pending withdrawals."
+    
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_panel_markup)
 
     # ... rest of the function continues normally ...
 
@@ -4914,31 +4957,66 @@ async def admin_command_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 log.error(f"Broadcast failed to {u['telegram_id']}: {e}")
         await update.message.reply_text(f"Broadcast sent to {sent} users.")
     elif text.startswith("/admin_withdraw"):
-        parts = text.split()
-        if len(parts) < 3:
-            await update.message.reply_text("Usage: /admin_withdraw <withdrawal_id> approve|reject [reason]")
+    parts = text.split()
+    if len(parts) < 3:
+        await update.message.reply_text("Usage: /admin_withdraw <withdrawal_id> approve|reject [reason]")
+        return
+    
+    # Clean up HTML-encoded ID
+    raw_wd_id = parts[1].replace("&lt;", "").replace("&gt;", "").replace("<", "").replace(">", "")
+    
+    try:
+        wd_id = int(raw_wd_id)
+    except ValueError:
+        await update.message.reply_text(f"Invalid withdrawal ID: {parts[1]}\nUse number only (e.g., 1, 2, 3)")
+        return
+    
+    action = parts[2].lower()
+    reason = " ".join(parts[3:]) if len(parts) > 3 else None
+    
+    with get_db() as db:
+        # Get withdrawal with bank details
+        wd = db.execute("""
+            SELECT w.*, u.username, u.telegram_id,
+                   b.account_num, b.account_name, b.bank_name
+            FROM withdrawals w 
+            JOIN users u ON w.user_id = u.id
+            LEFT JOIN bank_details b ON u.id = b.user_id
+            WHERE w.id = ?
+        """, (wd_id,)).fetchone()
+        
+        if not wd:
+            await update.message.reply_text(f"Withdrawal #{wd_id} not found.")
             return
-        wd_id = int(parts[1])
-        action = parts[2].lower()
-        reason = " ".join(parts[3:]) if len(parts)>3 else None
-        with get_db() as db:
-            wd = db.execute("SELECT * FROM withdrawals WHERE id=?", (wd_id,)).fetchone()
-            if not wd:
-                await update.message.reply_text("Withdrawal not found.")
-                return
-            if wd["status"] != "pending":
-                await update.message.reply_text("Withdrawal already processed.")
-                return
-            if action == "approve":
-                db.execute("UPDATE withdrawals SET status='done', updated_at=datetime('now') WHERE id=?", (wd_id,))
-                _admin_log(db, get_internal_user_id(ADMIN_TELEGRAM_ID), "approve_withdrawal", f"WD#{wd_id}", None)
-                await send_telegram(wd["user_id"], f"✅ Your withdrawal of {wd['pts_amount']} points has been approved and is being processed.")
-            else:
-                db.execute("UPDATE withdrawals SET status='rejected', reason=?, updated_at=datetime('now') WHERE id=?", (reason or "Rejected by admin", wd_id))
-                _credit(db, wd["user_id"], wd["pts_amount"], f"Refund WD#{wd_id}")
-                _admin_log(db, get_internal_user_id(ADMIN_TELEGRAM_ID), "reject_withdrawal", f"WD#{wd_id}", reason)
-                await send_telegram(wd["user_id"], f"❌ Your withdrawal of {wd['pts_amount']} points was rejected. Reason: {reason or 'Rejected by admin'}. Points refunded.")
-        await update.message.reply_text(f"Withdrawal {wd_id} {action}d.")
+        if wd["status"] != "pending":
+            await update.message.reply_text(f"Withdrawal #{wd_id} is already {wd['status']}.")
+            return
+        
+        # Build details for confirmation
+        details = f"\n📝 *Details:*\n"
+        details += f"👤 User: {wd['username']}\n"
+        details += f"💰 Amount: ₦{wd['amount']:.2f}\n"
+        
+        if wd["method"] == "bank":
+            details += f"🏦 Bank: {wd['bank_name'] or 'N/A'}\n"
+            details += f"🔢 Account: {wd['account_num'] or 'N/A'}\n"
+            details += f"👤 Name: {wd['account_name'] or 'N/A'}\n"
+        elif wd["method"] == "trx" and wd["wallet_addr"]:
+            details += f"💎 TRX Wallet: {wd['wallet_addr']}\n"
+        
+        if action == "approve":
+            db.execute("UPDATE withdrawals SET status='done', updated_at=datetime('now') WHERE id=?", (wd_id,))
+            _admin_log(db, get_internal_user_id(ADMIN_TELEGRAM_ID), "approve_withdrawal", f"WD#{wd_id}", None)
+            await send_telegram(wd["user_id"], f"✅ Your withdrawal of {wd['pts_amount']} points (≈ ₦{wd['amount']:.2f}) has been approved and is being processed.")
+            await update.message.reply_text(f"✅ Withdrawal #{wd_id} approved!{details}")
+        elif action == "reject":
+            db.execute("UPDATE withdrawals SET status='rejected', reason=?, updated_at=datetime('now') WHERE id=?", (reason or "Rejected by admin", wd_id))
+            _credit(db, wd["user_id"], wd["pts_amount"], f"Refund WD#{wd_id}")
+            _admin_log(db, get_internal_user_id(ADMIN_TELEGRAM_ID), "reject_withdrawal", f"WD#{wd_id}", reason)
+            await send_telegram(wd["user_id"], f"❌ Your withdrawal of {wd['pts_amount']} points was rejected. Reason: {reason or 'Rejected by admin'}. Points refunded.")
+            await update.message.reply_text(f"❌ Withdrawal #{wd_id} rejected.{details}")
+        else:
+            await update.message.reply_text("Action must be 'approve' or 'reject'")
 
 # Handle document import for admin
 async def handle_import_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
