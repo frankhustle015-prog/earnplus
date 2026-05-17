@@ -206,12 +206,20 @@ def _verify_pw(p, h):
 
 def get_setting(k, d=None):
     with get_db() as db:
-        r = db.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
+        is_postgres = DATABASE_URL is not None
+        if is_postgres:
+            r = db.execute("SELECT value FROM settings WHERE key=%s", (k,)).fetchone()
+        else:
+            r = db.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
         return r["value"] if r else d
 
 def set_setting(k, v):
     with get_db() as db:
-        db.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", (k, str(v)))
+        is_postgres = DATABASE_URL is not None
+        if is_postgres:
+            db.execute("INSERT INTO settings(key, value) VALUES(%s, %s) ON CONFLICT (key) DO UPDATE SET value=%s", (k, str(v), str(v)))
+        else:
+            db.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", (k, str(v)))
 
 def get_earning_mode() -> str:
     return get_setting("earning_mode", "manual")
@@ -233,14 +241,26 @@ def pts_to_ngn(points: int) -> float:
     return (points / ppm * npm) if ppm > 0 else 0
 
 def _credit(db, uid, amt, desc, t="earn"):
-    db.execute("UPDATE users SET balance=balance+? WHERE id=?", (amt, uid))
-    db.execute("INSERT INTO transactions(user_id,type,amount,description) VALUES(?,?,?,?)",
-               (uid, t, amt, desc))
+    is_postgres = DATABASE_URL is not None
+    if is_postgres:
+        db.execute("UPDATE users SET balance=balance+%s WHERE id=%s", (amt, uid))
+        db.execute("INSERT INTO transactions(user_id,type,amount,description) VALUES(%s,%s,%s,%s)",
+                   (uid, t, amt, desc))
+    else:
+        db.execute("UPDATE users SET balance=balance+? WHERE id=?", (amt, uid))
+        db.execute("INSERT INTO transactions(user_id,type,amount,description) VALUES(?,?,?,?)",
+                   (uid, t, amt, desc))
 
 def _debit(db, uid, amt, desc):
-    db.execute("UPDATE users SET balance=balance-? WHERE id=?", (amt, uid))
-    db.execute("INSERT INTO transactions(user_id,type,amount,description) VALUES(?,?,?,?)",
-               (uid, "debit", amt, desc))
+    is_postgres = DATABASE_URL is not None
+    if is_postgres:
+        db.execute("UPDATE users SET balance=balance-%s WHERE id=%s", (amt, uid))
+        db.execute("INSERT INTO transactions(user_id,type,amount,description) VALUES(%s,%s,%s,%s)",
+                   (uid, "debit", amt, desc))
+    else:
+        db.execute("UPDATE users SET balance=balance-? WHERE id=?", (amt, uid))
+        db.execute("INSERT INTO transactions(user_id,type,amount,description) VALUES(?,?,?,?)",
+                   (uid, "debit", amt, desc))
 
 def _notify(db, user_id, title, body, ntype="info"):
     db.execute("INSERT INTO notifications(user_id,title,body,type) VALUES(?,?,?,?)",
@@ -263,11 +283,19 @@ def _admin_log(db, admin_id, action, target=None, detail=None):
 
 def _increment_daily_msgs(db, user_id: int, count: int = 1):
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    db.execute(
-        "INSERT INTO daily_msgs(user_id, date, msgs_count) VALUES(?,?,?) "
-        "ON CONFLICT(user_id, date) DO UPDATE SET msgs_count=msgs_count+?",
-        (user_id, today, count, count)
-    )
+    is_postgres = DATABASE_URL is not None
+    if is_postgres:
+        db.execute(
+            "INSERT INTO daily_msgs(user_id, date, msgs_count) VALUES(%s, %s, %s) "
+            "ON CONFLICT(user_id, date) DO UPDATE SET msgs_count = daily_msgs.msgs_count + %s",
+            (user_id, today, count, count)
+        )
+    else:
+        db.execute(
+            "INSERT INTO daily_msgs(user_id, date, msgs_count) VALUES(?,?,?) "
+            "ON CONFLICT(user_id, date) DO UPDATE SET msgs_count=msgs_count+?",
+            (user_id, today, count, count)
+        )
 
 def init_db():
     with get_db() as db:
