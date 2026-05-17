@@ -2749,7 +2749,7 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔗 Referral code: `{u['referral_code']}`"
     )
     
-    await stop_spinner(context, text, success=True)
+    await stop_spinner(context, text, success=True, parse_mode=None)
 # Add number conversation
 async def add_number_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Get user's personal earning mode from database
@@ -4448,16 +4448,24 @@ async def check_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.execute("SELECT COUNT(*) as c FROM users")
             user_count = db.fetchone()['c']
             
-            await update.message.reply_text(
-                f"✅ **Database Connected!**\n\n"
-                f"📦 **Type:** {db_type}\n"
-                f"🔢 **Users:** {user_count}\n"
-                f"🆔 **Version:** {version}\n\n"
-                f"{'🎉 Your data will persist forever across redeployments!' if is_postgres else '⚠️ WARNING: Using SQLite - data will be lost on redeploy!'}",
-                parse_mode="Markdown"
+            # Build message without problematic Markdown characters
+            message = (
+                f"✅ Database Connected!\n\n"
+                f"📦 Type: {db_type}\n"
+                f"🔢 Users: {user_count}\n"
+                f"🆔 Version: {version}\n\n"
             )
+            
+            if is_postgres:
+                message += "🎉 Your data will persist forever across redeployments!"
+            else:
+                message += "⚠️ WARNING: Using SQLite - data will be lost on redeploy!"
+            
+            # Send with parse_mode=None to avoid Markdown parsing issues
+            await update.message.reply_text(message, parse_mode=None)
+            
     except Exception as e:
-        await update.message.reply_text(f"❌ Database error: {str(e)[:200]}")
+        await update.message.reply_text(f"❌ Database error: {str(e)[:200]}", parse_mode=None)
     
 async def test_wacash_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Test WorkGo1 API directly"""
@@ -4616,7 +4624,7 @@ async def update_spinner(context: ContextTypes.DEFAULT_TYPE,
 
 async def stop_spinner(context: ContextTypes.DEFAULT_TYPE,
                         final_text: str, success: bool = True,
-                        parse_mode: str = "Markdown") -> None:
+                        parse_mode: str = None) -> None:
     """Stop the animation and replace with the final result message."""
     task = context.user_data.pop("_spinner_task", None)
     if task and not task.done():
@@ -4630,7 +4638,15 @@ async def stop_spinner(context: ContextTypes.DEFAULT_TYPE,
             parse_mode=parse_mode
         )
     except Exception:
-        pass
+        # If edit fails, try sending as new message without formatting
+        try:
+            await context.bot.send_message(
+                chat_id=context.user_data.get("spinner_chat_id"),
+                text=f"{icon}  {final_text}",
+                parse_mode=None
+            )
+        except Exception:
+            pass
     context.user_data.pop("spinner_msg_id", None)
     context.user_data.pop("spinner_chat_id", None)
     
