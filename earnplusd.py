@@ -4253,74 +4253,88 @@ async def handle_settings_input(update: Update, context: ContextTypes.DEFAULT_TY
             db.execute("INSERT OR REPLACE INTO trx_wallets(user_id,wallet_address) VALUES(?,?)", (uid, addr))
         await update.message.reply_text("✅ TRX wallet saved.")
     elif action == "manual_creds":
-        parts = update.message.text.strip().split(None, 1)
-        if len(parts) != 2:
-            await update.message.reply_text(
-                "❌ Invalid format. Send: `username password`\nExample: `Frankhustle f11111`",
-                parse_mode="Markdown"
-            )
-            return
-        new_user, new_pass = parts[0].strip(), parts[1].strip()
-        if not new_user or not new_pass:
-            await update.message.reply_text("❌ Both username and password are required.")
-            return
-
-        # Update the global variables
-        global PLATFORM_USER, PLATFORM_PASS
-        PLATFORM_USER = new_user
-        PLATFORM_PASS = new_pass
-
-        # Clear old session so it re-logs in fresh
-        with platform_lock:
-            platform_session.clear()
-
-        # Test the new credentials immediately
-        wait_msg = await update.message.reply_text(
-            f"⏳ Testing new credentials for `{new_user}`...",
+    parts = update.message.text.strip().split(None, 1)
+    if len(parts) != 2:
+        await update.message.reply_text(
+            "❌ Invalid format. Send: `username password`\nExample: `Frankhustle f11111`",
             parse_mode="Markdown"
         )
-        loop = asyncio.get_event_loop()
-        ok = await loop.run_in_executor(None, platform_login)
-        if ok:
-            with platform_lock:
-                uid_on_platform = platform_session.get("userid", "?")
-            await wait_msg.edit_text(
-                f"✅ *Credentials Updated & Login Successful!*\n\n"
-                f"👤 Username: `{new_user}`\n"
-                f"🆔 Platform UID: `{uid_on_platform}`\n\n"
-                f"Manual mode is ready to use.",
-                parse_mode="Markdown"
-            )
-        else:
-            await wait_msg.edit_text(
-                f"⚠️ *Credentials saved but login failed!*\n\n"
-                f"👤 Username: `{new_user}`\n\n"
-                f"Please check the username/password and try again.\n"
-                f"Use '🧪 Test Manual Login' to retry.",
-                parse_mode="Markdown"
-            )
-        context.user_data.pop("setting_action", None)
+        return
+    new_user, new_pass = parts[0].strip(), parts[1].strip()
+    if not new_user or not new_pass:
+        await update.message.reply_text("❌ Both username and password are required.")
         return
 
+    # Update the global variables
+    global PLATFORM_USER, PLATFORM_PASS
+    PLATFORM_USER = new_user
+    PLATFORM_PASS = new_pass
+
+    # Clear old session so it re-logs in fresh
+    with platform_lock:
+        platform_session.clear()
+
+    # Test the new credentials immediately
+    wait_msg = await update.message.reply_text(
+        f"⏳ Testing new credentials for `{new_user}`...",
+        parse_mode="Markdown"
+    )
+    loop = asyncio.get_event_loop()
+    ok = await loop.run_in_executor(None, platform_login)
+    if ok:
+        with platform_lock:
+            uid_on_platform = platform_session.get("userid", "?")
+        await wait_msg.edit_text(
+            f"✅ *Credentials Updated & Login Successful!*\n\n"
+            f"👤 Username: `{new_user}`\n"
+            f"🆔 Platform UID: `{uid_on_platform}`\n\n"
+            f"Manual mode is ready to use.",
+            parse_mode="Markdown"
+        )
+    else:
+        await wait_msg.edit_text(
+            f"⚠️ *Credentials saved but login failed!*\n\n"
+            f"👤 Username: `{new_user}`\n\n"
+            f"Please check the username/password and try again.\n"
+            f"Use '🧪 Test Manual Login' to retry.",
+            parse_mode="Markdown"
+        )
+    context.user_data.pop("setting_action", None)
+    return
+
     elif action == "wacash_creds":
-        parts = update.message.text.strip().split()
-        if len(parts) != 2:
-            await update.message.reply_text("Invalid format. Send: `phone_number password`")
-            return
-        phone, pwd = parts[0].strip(), parts[1].strip()
-        if not phone or not pwd:
-            await update.message.reply_text("Both phone and password are required.")
-            return
-        with get_db() as db:
-            db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('wacash_account', ?)", (phone,))
-            db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('wacash_password', ?)", (pwd,))
-        if wacash_login():
-            await update.message.reply_text("✅ Wacash credentials saved and login successful!")
-        else:
-            await update.message.reply_text("⚠️ Credentials saved but login failed. Please check the account/password.")
-        context.user_data.pop("setting_action", None)
-        await settings_menu(update, context)
+    parts = update.message.text.strip().split()
+    if len(parts) != 2:
+        await update.message.reply_text("Invalid format. Send: `phone_number password`")
         return
+    phone, pwd = parts[0].strip(), parts[1].strip()
+    if not phone or not pwd:
+        await update.message.reply_text("Both phone and password are required.")
+        return
+    with get_db() as db:
+        if DATABASE_URL:
+            # PostgreSQL syntax with ON CONFLICT
+            db.execute(
+                "INSERT INTO settings(key, value) VALUES(%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                ('wacash_account', phone)
+            )
+            db.execute(
+                "INSERT INTO settings(key, value) VALUES(%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                ('wacash_password', pwd)
+            )
+        else:
+            # SQLite syntax
+            db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", ('wacash_account', phone))
+            db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", ('wacash_password', pwd))
+    # Clear cache to force refresh
+    clear_settings_cache()
+    if wacash_login():
+        await update.message.reply_text("✅ Wacash credentials saved and login successful!")
+    else:
+        await update.message.reply_text("⚠️ Credentials saved but login failed. Please check the account/password.")
+    context.user_data.pop("setting_action", None)
+    await settings_menu(update, context)
+    return
     elif action == "wacash_threads":
         try:
             threads = int(update.message.text.strip())
@@ -4333,31 +4347,32 @@ async def handle_settings_input(update: Update, context: ContextTypes.DEFAULT_TY
         await settings_menu(update, context)
         return
     elif action == "points_per_msg":
-        try:
-            points = int(update.message.text.strip())
-            if points < 1:
-                await update.message.reply_text("Points must be at least 1.")
-                return
-            set_setting("points_per_msg", str(points))
-            await update.message.reply_text(f"✅ Points per message set to **{points}** points.\n\nUsers will now earn {points} points per message sent.\n⚠️ Existing balances remain unchanged.")
-        except ValueError:
-            await update.message.reply_text("❌ Invalid number. Please send a valid number.")
-        context.user_data.pop("setting_action", None)
-        await settings_menu(update, context)
-        return
+    try:
+        points = int(update.message.text.strip())
+        if points < 1:
+            await update.message.reply_text("Points must be at least 1.")
+            return
+        set_setting("points_per_msg", str(points))
+        await update.message.reply_text(f"✅ Points per message set to **{points}** points.\n\nUsers will now earn {points} points per message sent.\n⚠️ Existing balances remain unchanged.")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid number. Please send a valid number.")
+    context.user_data.pop("setting_action", None)
+    await settings_menu(update, context)
+    return
+
     elif action == "naira_per_msg":
-        try:
-            naira = float(update.message.text.strip())
-            if naira < 0.01:
-                await update.message.reply_text("Naira value must be at least 0.01.")
-                return
-            set_setting("naira_per_msg", str(naira))
-            await update.message.reply_text(f"✅ Naira per point set to **₦{naira}**.\n\n1 point = ₦{naira}\n⚠️ Existing balances remain unchanged.\n\n*Example:* 200 points = ₦{200 * naira:.2f}", parse_mode="Markdown")
-        except ValueError:
-            await update.message.reply_text("❌ Invalid number. Please send a valid number.")
-        context.user_data.pop("setting_action", None)
-        await settings_menu(update, context)
-        return
+    try:
+        naira = float(update.message.text.strip())
+        if naira < 0.01:
+            await update.message.reply_text("Naira value must be at least 0.01.")
+            return
+        set_setting("naira_per_msg", str(naira))
+        await update.message.reply_text(f"✅ Naira per point set to **₦{naira}**.\n\n1 point = ₦{naira}\n⚠️ Existing balances remain unchanged.\n\n*Example:* 200 points = ₦{200 * naira:.2f}", parse_mode="Markdown")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid number. Please send a valid number.")
+    context.user_data.pop("setting_action", None)
+    await settings_menu(update, context)
+    return
     
     # ========== HOURLY ADMIN INPUT HANDLERS ==========
     elif action == "admin_hourly_rate":
