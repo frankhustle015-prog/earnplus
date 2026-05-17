@@ -1424,7 +1424,8 @@ def task4u_get_online_numbers() -> set:
 
 def task4u_get_hosting_time(account: str) -> int | None:
     """
-    Return hosting_time (hours online) for a specific number
+    Return hosting_time (HOURS online) for a specific number.
+    API returns SECONDS, so we convert to hours.
     """
     s = _task4u_ps()
     token = s.get("token")
@@ -1442,7 +1443,9 @@ def task4u_get_hosting_time(account: str) -> int | None:
         if d.get("code") == 0 and d.get("data", {}).get("data"):
             for item in d["data"]["data"]:
                 if item.get("ws_account") == account:
-                    return item.get("hosting_time", 0)
+                    # Convert SECONDS to HOURS
+                    seconds = item.get("hosting_time", 0)
+                    return seconds // 3600  # Return full hours only
         return None
     except Exception as e:
         log.error(f"[Task4U] get_hosting_time({account}) error: {e}")
@@ -2008,8 +2011,14 @@ def _pair_hourly_bg(user_id: int, account: str):
     while time.time() < deadline:
         online_set = task4u_get_online_numbers()
         if account in online_set:
-            # Success! Get hosting_time
-            current_hours = task4u_get_hosting_time(account)
+            # Success! Get hosting_time (API returns SECONDS)
+            current_seconds = task4u_get_hosting_time(account)
+            
+            # Convert SECONDS to HOURS (full hours only)
+            current_hours = (current_seconds // 3600) if current_seconds else 0
+            
+            log.info(f"[HourlyPair] {account} came online - Seconds: {current_seconds} → Hours: {current_hours}")
+            
             with get_db() as db:
                 is_postgres = DATABASE_URL is not None
                 if is_postgres:
@@ -2021,7 +2030,7 @@ def _pair_hourly_bg(user_id: int, account: str):
                             last_hourly_payout_time = CURRENT_TIMESTAMP,
                             pair_code = NULL
                         WHERE user_id=%s AND account=%s
-                    """, (current_hours or 0, user_id, account))
+                    """, (current_hours, user_id, account))
                 else:
                     db.execute("""
                         UPDATE numbers
@@ -2031,7 +2040,7 @@ def _pair_hourly_bg(user_id: int, account: str):
                             last_hourly_payout_time = CURRENT_TIMESTAMP,
                             pair_code = NULL
                         WHERE user_id=? AND account=?
-                    """, (current_hours or 0, user_id, account))
+                    """, (current_hours, user_id, account))
             asyncio.run_coroutine_threadsafe(
                 send_telegram(
                     telegram_id,
@@ -2628,9 +2637,12 @@ async def handle_number_came_online(row):
         if not task4u_session.get("token"):
             task4u_login()
 
-    current_hours = task4u_get_hosting_time(account)
-    if current_hours is None:
-        current_hours = 0
+    current_seconds = task4u_get_hosting_time(account)
+if current_seconds is None:
+    current_hours = 0
+else:
+    # Convert seconds to hours (if function still returns seconds)
+    current_hours = current_seconds // 3600 if current_seconds > 1000 else current_seconds
 
     with get_db() as db:
         db.execute("""
@@ -2742,12 +2754,15 @@ async def hourly_payout_monitor():
                 """).fetchall()
 
             for row in rows:
-                current_hours = task4u_get_hosting_time(row["account"])
-                if current_hours is None:
-                    continue
+                current_seconds = task4u_get_hosting_time(row["account"])
+if current_seconds is None:
+    continue
 
-                last_hours = row["platform_hours_at_start"]
-                new_hours = current_hours - last_hours
+# Convert seconds to hours (if function still returns seconds)
+# If you already fixed task4u_get_hosting_time, current_seconds is already hours
+current_hours = current_seconds // 3600 if current_seconds > 1000 else current_seconds
+last_hours = row["platform_hours_at_start"]
+new_hours = current_hours - last_hours
                 if new_hours <= 0:
                     continue
 
@@ -2805,12 +2820,13 @@ async def force_hourly_payout():
 
         paid_count = 0
         for row in rows:
-            current_hours = task4u_get_hosting_time(row["account"])
-            if current_hours is None:
-                continue
+            current_seconds = task4u_get_hosting_time(row["account"])
+if current_seconds is None:
+    continue
 
-            last_hours = row["platform_hours_at_start"]
-            new_hours = current_hours - last_hours
+current_hours = current_seconds // 3600 if current_seconds > 1000 else current_seconds
+last_hours = row["platform_hours_at_start"]
+new_hours = current_hours - last_hours
             if new_hours <= 0:
                 continue
 
@@ -4064,21 +4080,26 @@ async def hourly_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_earned_ngn += earned_ngn
         pairing_status = num["status"]
         
-        # Get platform online time if number is online
-        platform_hours = None
+        # Get platform online time if number is online (API returns SECONDS)
+        platform_seconds = None
         is_online_on_platform = account in platform_online_set
         
         if is_online_on_platform:
-            platform_hours = task4u_get_hosting_time(account)
+            platform_seconds = task4u_get_hosting_time(account)
         
         if status == "online" or is_online_on_platform:
             active_count += 1
             emoji = "🟢"
             status_text = "ONLINE"
             
-            # Show platform online time
-            if platform_hours is not None and platform_hours > 0:
-                status_text += f" · Platform: {platform_hours}h online"
+            # Show platform online time (convert seconds to hours/minutes)
+            if platform_seconds is not None and platform_seconds > 0:
+                hours = platform_seconds // 3600
+                minutes = (platform_seconds % 3600) // 60
+                if hours > 0:
+                    status_text += f" · Platform: {hours}h {minutes}m online"
+                else:
+                    status_text += f" · Platform: {minutes}m online"
             
             # Calculate current session hours from our DB
             start_time = num["hourly_start_time"]
