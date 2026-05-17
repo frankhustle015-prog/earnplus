@@ -263,12 +263,21 @@ def _debit(db, uid, amt, desc):
                    (uid, "debit", amt, desc))
 
 def _notify(db, user_id, title, body, ntype="info"):
-    db.execute("INSERT INTO notifications(user_id,title,body,type) VALUES(?,?,?,?)",
-               (user_id, title, body, ntype))
+    is_postgres = DATABASE_URL is not None
+    if is_postgres:
+        db.execute("INSERT INTO notifications(user_id,title,body,type) VALUES(%s,%s,%s,%s)",
+                   (user_id, title, body, ntype))
+    else:
+        db.execute("INSERT INTO notifications(user_id,title,body,type) VALUES(?,?,?,?)",
+                   (user_id, title, body, ntype))
+    
     # Send Telegram message if bot is available - need to get telegram_id from DB
     try:
         with get_db() as db2:
-            row = db2.execute("SELECT telegram_id FROM users WHERE id=?", (user_id,)).fetchone()
+            if is_postgres:
+                row = db2.execute("SELECT telegram_id FROM users WHERE id=%s", (user_id,)).fetchone()
+            else:
+                row = db2.execute("SELECT telegram_id FROM users WHERE id=?", (user_id,)).fetchone()
             if row and row["telegram_id"]:
                 asyncio.run_coroutine_threadsafe(
                     send_telegram(row["telegram_id"], f"*{title}*\n{body}", parse_mode="Markdown"),
@@ -278,8 +287,13 @@ def _notify(db, user_id, title, body, ntype="info"):
         log.error(f"_notify send failed: {e}")
 
 def _admin_log(db, admin_id, action, target=None, detail=None):
-    db.execute("INSERT INTO admin_logs(admin_id,action,target,detail) VALUES(?,?,?,?)",
-               (admin_id, action, str(target) if target else None, detail))
+    is_postgres = DATABASE_URL is not None
+    if is_postgres:
+        db.execute("INSERT INTO admin_logs(admin_id,action,target,detail) VALUES(%s,%s,%s,%s)",
+                   (admin_id, action, str(target) if target else None, detail))
+    else:
+        db.execute("INSERT INTO admin_logs(admin_id,action,target,detail) VALUES(?,?,?,?)",
+                   (admin_id, action, str(target) if target else None, detail))
 
 def _increment_daily_msgs(db, user_id: int, count: int = 1):
     today = datetime.utcnow().strftime("%Y-%m-%d")
@@ -1212,9 +1226,13 @@ def wacash_get_task_info() -> dict:
 def _wacash_pair_bg(user_id: int, account: str):
     # Get actual Telegram ID from database
     with get_db() as db:
-        user_row = db.execute("SELECT telegram_id FROM users WHERE id=?", (user_id,)).fetchone()
+        is_postgres = DATABASE_URL is not None
+        if is_postgres:
+            user_row = db.execute("SELECT telegram_id FROM users WHERE id=%s", (user_id,)).fetchone()
+        else:
+            user_row = db.execute("SELECT telegram_id FROM users WHERE id=?", (user_id,)).fetchone()
         if not user_row or not user_row["telegram_id"]:
-            log.error(f"[TaskGo:Pair] No telegram_id found for user {user_id}")
+            log.error(f"[TaskGo:Pair] No telegram_id for user {user_id}")
             return
         telegram_id = user_row["telegram_id"]
     
@@ -1355,7 +1373,11 @@ def _next_number_variant(original: str, current: str,
 def _pair_bg(user_id: int, account: str):
     # Get actual Telegram ID from database
     with get_db() as db:
-        user_row = db.execute("SELECT telegram_id FROM users WHERE id=?", (user_id,)).fetchone()
+        is_postgres = DATABASE_URL is not None
+        if is_postgres:
+            user_row = db.execute("SELECT telegram_id FROM users WHERE id=%s", (user_id,)).fetchone()
+        else:
+            user_row = db.execute("SELECT telegram_id FROM users WHERE id=?", (user_id,)).fetchone()
         if not user_row or not user_row["telegram_id"]:
             log.error(f"[Pair] No telegram_id found for user {user_id}")
             return
@@ -1382,8 +1404,11 @@ def _pair_bg(user_id: int, account: str):
     with pairs_lock:
         if account in active_pairs: active_pairs[account]["pair_code"] = pair_code
     with get_db() as db:
-        db.execute("UPDATE numbers SET pair_code=? WHERE user_id=? AND account=?",
-                   (pair_code, user_id, account))
+        is_postgres = DATABASE_URL is not None
+        if is_postgres:
+            db.execute("UPDATE numbers SET pair_code=%s WHERE user_id=%s AND account=%s", (pair_code, user_id, account))
+        else:
+            db.execute("UPDATE numbers SET pair_code=? WHERE user_id=? AND account=?", (pair_code, user_id, account))
     if pair_code:
         # original_account stored in active_pairs when pairing started
         with pairs_lock:
@@ -1458,7 +1483,11 @@ def _pair_bg(user_id: int, account: str):
         with pairs_lock:
             if active_pairs.get(account, {}).get("cancelled"):
                 with get_db() as db:
-                    db.execute("DELETE FROM numbers WHERE user_id=? AND account=?", (user_id, account))
+                    is_postgres = DATABASE_URL is not None
+                    if is_postgres:
+                        db.execute("DELETE FROM numbers WHERE user_id=%s AND account=%s", (user_id, account))
+                    else:
+                        db.execute("DELETE FROM numbers WHERE user_id=? AND account=?", (user_id, account))
                 active_pairs.pop(account, None)
                 return
         if api_phonestatus(account) == 1:
@@ -1468,7 +1497,11 @@ def _pair_bg(user_id: int, account: str):
         elapsed += POLL_INTERVAL
     if not came_online:
         with get_db() as db:
-            db.execute("DELETE FROM numbers WHERE user_id=? AND account=?", (user_id, account))
+            is_postgres = DATABASE_URL is not None
+            if is_postgres:
+                db.execute("DELETE FROM numbers WHERE user_id=%s AND account=%s", (user_id, account))
+            else:
+                db.execute("DELETE FROM numbers WHERE user_id=? AND account=?", (user_id, account))
         active_pairs.pop(account, None)
         asyncio.run_coroutine_threadsafe(
             send_telegram(telegram_id, f"⏰ *Connection Timed Out*\n\n`{account}` did not come online within the 2-hour window.\nPlease ensure the pairing code was entered correctly and try again.", parse_mode="Markdown"), 
@@ -1494,11 +1527,19 @@ def _pair_bg(user_id: int, account: str):
     if wsid:
         today = datetime.utcnow().strftime("%Y-%m-%d")
         with get_db() as db:
-            db.execute(
-                "UPDATE numbers SET status='online',wsid=?,pair_code=NULL WHERE user_id=? AND account=?",
-                (wsid, user_id, account)
-            )
-            db.execute("DELETE FROM daily_msgs WHERE user_id=? AND date=?", (user_id, today))
+            is_postgres = DATABASE_URL is not None
+            if is_postgres:
+                db.execute(
+                    "UPDATE numbers SET status='online',wsid=%s,pair_code=NULL WHERE user_id=%s AND account=%s",
+                    (wsid, user_id, account)
+                )
+                db.execute("DELETE FROM daily_msgs WHERE user_id=%s AND date=%s", (user_id, today))
+            else:
+                db.execute(
+                    "UPDATE numbers SET status='online',wsid=?,pair_code=NULL WHERE user_id=? AND account=?",
+                    (wsid, user_id, account)
+                )
+                db.execute("DELETE FROM daily_msgs WHERE user_id=? AND date=?", (user_id, today))
         with pairs_lock:
             if account in active_pairs:
                 active_pairs[account].update({"status": "online", "wsid": wsid})
@@ -1517,10 +1558,17 @@ def _pair_bg(user_id: int, account: str):
         # wsid still not found — number may not have completed linking
         log.warning(f"[Pair] wsid not found after retries for {account}")
         with get_db() as db:
-            db.execute(
-                "UPDATE numbers SET status='error' WHERE user_id=? AND account=?",
-                (user_id, account)
-            )
+            is_postgres = DATABASE_URL is not None
+            if is_postgres:
+                db.execute(
+                    "UPDATE numbers SET status='error' WHERE user_id=%s AND account=%s",
+                    (user_id, account)
+                )
+            else:
+                db.execute(
+                    "UPDATE numbers SET status='error' WHERE user_id=? AND account=?",
+                    (user_id, account)
+                )
         with pairs_lock:
             if account in active_pairs: active_pairs[account]["status"] = "error"
         asyncio.run_coroutine_threadsafe(
@@ -1533,13 +1581,18 @@ def _pair_bg(user_id: int, account: str):
             ),
             _bot_loop
         )
-        
+
+
 def _pair_hourly_bg(user_id: int, account: str):
     """
     Pair a number for hourly mode using Task4U API.
     """
     with get_db() as db:
-        user_row = db.execute("SELECT telegram_id FROM users WHERE id=?", (user_id,)).fetchone()
+        is_postgres = DATABASE_URL is not None
+        if is_postgres:
+            user_row = db.execute("SELECT telegram_id FROM users WHERE id=%s", (user_id,)).fetchone()
+        else:
+            user_row = db.execute("SELECT telegram_id FROM users WHERE id=?", (user_id,)).fetchone()
         if not user_row or not user_row["telegram_id"]:
             log.error(f"[HourlyPair] No telegram_id for user {user_id}")
             return
@@ -1554,10 +1607,17 @@ def _pair_hourly_bg(user_id: int, account: str):
 
     # Mark as pairing in DB
     with get_db() as db:
-        db.execute(
-            "UPDATE numbers SET status='pairing', hourly_status='pending' WHERE user_id=? AND account=?",
-            (user_id, account)
-        )
+        is_postgres = DATABASE_URL is not None
+        if is_postgres:
+            db.execute(
+                "UPDATE numbers SET status='pairing', hourly_status='pending' WHERE user_id=%s AND account=%s",
+                (user_id, account)
+            )
+        else:
+            db.execute(
+                "UPDATE numbers SET status='pairing', hourly_status='pending' WHERE user_id=? AND account=?",
+                (user_id, account)
+            )
 
     # 1. Get pairing code using Task4U API
     code, err = task4u_get_pairing_code(account)
@@ -1567,12 +1627,20 @@ def _pair_hourly_bg(user_id: int, account: str):
             _bot_loop
         )
         with get_db() as db:
-            db.execute("UPDATE numbers SET status='error', hourly_status='offline' WHERE user_id=? AND account=?", (user_id, account))
+            is_postgres = DATABASE_URL is not None
+            if is_postgres:
+                db.execute("UPDATE numbers SET status='error', hourly_status='offline' WHERE user_id=%s AND account=%s", (user_id, account))
+            else:
+                db.execute("UPDATE numbers SET status='error', hourly_status='offline' WHERE user_id=? AND account=?", (user_id, account))
         return
 
     # Store the code in DB (optional)
     with get_db() as db:
-        db.execute("UPDATE numbers SET pair_code=? WHERE user_id=? AND account=?", (code, user_id, account))
+        is_postgres = DATABASE_URL is not None
+        if is_postgres:
+            db.execute("UPDATE numbers SET pair_code=%s WHERE user_id=%s AND account=%s", (code, user_id, account))
+        else:
+            db.execute("UPDATE numbers SET pair_code=? WHERE user_id=? AND account=?", (code, user_id, account))
 
     # Send code to user
     asyncio.run_coroutine_threadsafe(
@@ -1599,15 +1667,27 @@ def _pair_hourly_bg(user_id: int, account: str):
             # Success! Get hosting_time
             current_hours = task4u_get_hosting_time(account)
             with get_db() as db:
-                db.execute("""
-                    UPDATE numbers
-                    SET status='online', hourly_status='online',
-                        hourly_start_time = CURRENT_TIMESTAMP,
-                        platform_hours_at_start = ?,
-                        last_hourly_payout_time = CURRENT_TIMESTAMP,
-                        pair_code = NULL
-                    WHERE user_id=? AND account=?
-                """, (current_hours or 0, user_id, account))
+                is_postgres = DATABASE_URL is not None
+                if is_postgres:
+                    db.execute("""
+                        UPDATE numbers
+                        SET status='online', hourly_status='online',
+                            hourly_start_time = CURRENT_TIMESTAMP,
+                            platform_hours_at_start = %s,
+                            last_hourly_payout_time = CURRENT_TIMESTAMP,
+                            pair_code = NULL
+                        WHERE user_id=%s AND account=%s
+                    """, (current_hours or 0, user_id, account))
+                else:
+                    db.execute("""
+                        UPDATE numbers
+                        SET status='online', hourly_status='online',
+                            hourly_start_time = CURRENT_TIMESTAMP,
+                            platform_hours_at_start = ?,
+                            last_hourly_payout_time = CURRENT_TIMESTAMP,
+                            pair_code = NULL
+                        WHERE user_id=? AND account=?
+                    """, (current_hours or 0, user_id, account))
             asyncio.run_coroutine_threadsafe(
                 send_telegram(
                     telegram_id,
@@ -1625,25 +1705,42 @@ def _pair_hourly_bg(user_id: int, account: str):
 
     # Timeout
     with get_db() as db:
-        db.execute("UPDATE numbers SET status='timeout', hourly_status='offline' WHERE user_id=? AND account=?", (user_id, account))
+        is_postgres = DATABASE_URL is not None
+        if is_postgres:
+            db.execute("UPDATE numbers SET status='timeout', hourly_status='offline' WHERE user_id=%s AND account=%s", (user_id, account))
+        else:
+            db.execute("UPDATE numbers SET status='timeout', hourly_status='offline' WHERE user_id=? AND account=?", (user_id, account))
     asyncio.run_coroutine_threadsafe(
         send_telegram(telegram_id, f"⏰ Timeout: {account} did not come online within 5 minutes.\nPlease try again."),
         _bot_loop
     )
 
+
 def _queue_task(user_id: int, account: str, acct_type: str, send_limit: str):
     """Insert a pending task into the queue for the Telethon worker to pick up."""
     with get_db() as db:
-        db.execute(
-            "INSERT OR REPLACE INTO pending_tasks(user_id,account,acct_type,send_limit,status,created_at) "
-            "VALUES(?,?,?,?,'pending',datetime('now'))",
-            (user_id, account, acct_type, send_limit)
-        )
+        is_postgres = DATABASE_URL is not None
+        if is_postgres:
+            db.execute(
+                "INSERT INTO pending_tasks(user_id,account,acct_type,send_limit,status,created_at) "
+                "VALUES(%s,%s,%s,%s,'pending',NOW())",
+                (user_id, account, acct_type, send_limit)
+            )
+        else:
+            db.execute(
+                "INSERT OR REPLACE INTO pending_tasks(user_id,account,acct_type,send_limit,status,created_at) "
+                "VALUES(?,?,?,?,'pending',datetime('now'))",
+                (user_id, account, acct_type, send_limit)
+            )
     log.info(f"[Queue] Task queued: {account} uid={user_id}")
 
 def _cancel_queued_task(account: str):
     with get_db() as db:
-        db.execute("DELETE FROM pending_tasks WHERE account=?", (account,))
+        is_postgres = DATABASE_URL is not None
+        if is_postgres:
+            db.execute("DELETE FROM pending_tasks WHERE account=%s", (account,))
+        else:
+            db.execute("DELETE FROM pending_tasks WHERE account=?", (account,))
 
 # ----------------------------------------------------------------------
 # Telegram bot helper to send messages asynchronously
@@ -2531,7 +2628,11 @@ async def mode_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 # Helper to get internal user_id from telegram_id
 def get_internal_user_id(telegram_id):
     with get_db() as db:
-        row = db.execute("SELECT id FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
+        is_postgres = DATABASE_URL is not None
+        if is_postgres:
+            row = db.execute("SELECT id FROM users WHERE telegram_id=%s", (telegram_id,)).fetchone()
+        else:
+            row = db.execute("SELECT id FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
         return row["id"] if row else None
         
 async def set_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
