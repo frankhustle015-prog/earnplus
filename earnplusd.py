@@ -882,7 +882,7 @@ def task4u_login() -> bool:
                 f"{TASK4U_BASE_URL}/login/login",
                 json=payload,
                 headers=headers,
-                timeout=30
+                timeout=45
             )
             
             log.info(f"[Task4U] Login response status: {r.status_code}")
@@ -957,26 +957,38 @@ def task4u_get_pairing_code(account: str) -> tuple[str | None, str | None]:
     if not token:
         return None, "Not logged in"
     
-    try:
-        r = s["http"].post(
-            f"{TASK4U_BASE_URL}/task/getwswebcode?token={token}",
-            json={"ws_account": account},
-            headers=_task4u_headers(),
-            timeout=15
-        )
-        d = r.json()
-        log.info(f"[Task4U] getwswebcode response for {account}: {d}")
-        if d.get("code") == 0 and d.get("data", {}).get("code"):
-            return d["data"]["code"], None
-        # Check if token expired
-        if d.get("code") in (401, 403) or "token" in str(d.get("msg", "")).lower():
-            log.warning("[Task4U] Token expired, re-logging...")
-            task4u_login()
-            return task4u_get_pairing_code(account)
-        return None, d.get("msg", "Unknown error")
-    except Exception as e:
-        log.error(f"[Task4U] get_pairing_code error: {e}")
-        return None, str(e)
+    # Increase timeout and add more retries
+    for attempt in range(3):
+        try:
+            log.info(f"[Task4U] Attempt {attempt+1} to get pairing code for {account}")
+            r = s["http"].post(
+                f"{TASK4U_BASE_URL}/task/getwswebcode?token={token}",
+                json={"ws_account": account},
+                headers=_task4u_headers(),
+                timeout=45  # Increased from 15 to 30 seconds
+            )
+            d = r.json()
+            log.info(f"[Task4U] getwswebcode response for {account}: {d}")
+            if d.get("code") == 0 and d.get("data", {}).get("code"):
+                return d["data"]["code"], None
+            # Check if token expired
+            if d.get("code") in (401, 403) or "token" in str(d.get("msg", "")).lower():
+                log.warning("[Task4U] Token expired, re-logging...")
+                task4u_login()
+                return task4u_get_pairing_code(account)
+            return None, d.get("msg", "Unknown error")
+        except requests.exceptions.Timeout:
+            log.warning(f"[Task4U] Timeout on attempt {attempt+1}/3 for {account}")
+            if attempt == 2:  # Last attempt
+                return None, "Connection timeout - please try again"
+            continue
+        except Exception as e:
+            log.error(f"[Task4U] get_pairing_code error: {e}")
+            if attempt == 2:
+                return None, str(e)
+            continue
+    
+    return None, "Max retries exceeded"
 
 
 def task4u_get_online_numbers() -> set:
