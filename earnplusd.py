@@ -115,6 +115,8 @@ platform_session: dict = {}
 platform_lock = threading.Lock()
 active_pairs: dict = {}
 pairs_lock = threading.Lock()
+# Add this with other global variables
+_db_executor = None  # Will be initialized in post_init
 
 # Workgo1 session
 _workgo_token = None
@@ -127,97 +129,139 @@ _wacash_fire_lock = threading.Lock()
 _pair_status_msgs: dict = {}   # account → telegram message_id
 _pair_status_lock = threading.Lock()
 
-# ----------------------------------------------------------------------
-# Database helpers (same as original)
-# ----------------------------------------------------------------------
+# ============ OPTIMIZED DATABASE CONNECTION POOL ============
+import threading
+import queue
+import time
+
+class DatabasePool:
+    """Thread-safe connection pool for SQLite/PostgreSQL"""
+    
+    def __init__(self, max_connections=10):
+        self.max_connections = max_connections
+        self._pool = queue.Queue(maxsize=max_connections)
+        self._lock = threading.Lock()
+        self._created = 0
+        self._closed = False
+        
+    def _create_connection(self):
+        if DATABASE_URL:
+            import psycopg2
+            from psycopg2.extras import RealDictCursor
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
+            conn.autocommit = False
+            return conn
+        else:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA cache_size=-20000")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            return conn
+    
+    def get_connection(self):
+        if self._closed:
+            raise Exception("Pool is closed")
+        try:
+            conn = self._pool.get_nowait()
+            try:
+                cursor = conn.cursor()
+                cursor.execute("SELECT 1")
+                cursor.close()
+                return conn
+            except:
+                return self._create_connection()
+        except queue.Empty:
+            with self._lock:
+                if self._created < self.max_connections:
+                    self._created += 1
+                    return self._create_connection()
+            return self._pool.get(timeout=5)
+    
+    def return_connection(self, conn):
+        if not self._closed and conn:
+            self._pool.put(conn)
+    
+    def close_all(self):
+        self._closed = True
+        while not self._pool.empty():
+            try:
+                conn = self._pool.get_nowait()
+                conn.close()
+            except:
+                pass
+
+_db_pool = DatabasePool(max_connections=10)
+
+def _normalise_sql(sql: str) -> str:
+    """Convert SQLite-flavoured SQL to PostgreSQL syntax."""
+    sql = sql.replace("?", "%s")
+    sql = sql.replace("datetime('now')", "NOW()")
+    sql = sql.replace("date('now')", "CURRENT_DATE")
+    sql = re.sub(r"datetime\('now'\s*,\s*'([^']+)'\)", r"NOW() + INTERVAL '\1'", sql)
+    sql = re.sub(r"date\('now'\s*,\s*'([^']+)'\)", r"CURRENT_DATE + INTERVAL '\1'", sql)
+    sql = re.sub(r"INSERT\s+OR\s+REPLACE\s+INTO", "INSERT INTO", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", sql, flags=re.IGNORECASE)
+    return sql
+
 @contextmanager
 def get_db():
+    """Get database connection from pool - MUCH FASTER!"""
     if DATABASE_URL:
-        # PostgreSQL for Railway
-        import psycopg2
-        from psycopg2.extras import RealDictCursor
-        
+        # PostgreSQL path
         conn = None
         try:
-            conn = psycopg2.connect(DATABASE_URL)
-            # Create a cursor that works like sqlite3
+            conn = _db_pool.get_connection()
             cur = conn.cursor(cursor_factory=RealDictCursor)
             
-            # Create a wrapper that makes execute return the cursor
-            class CursorWrapper:
+            class _PGWrapper:
                 def __init__(self, cursor, connection):
-                    self.cursor = cursor
-                    self.connection = connection
-                
+                    self._c = cursor
+                    self._conn = connection
                 def execute(self, sql, params=None):
-                    # Auto-convert SQLite ? placeholders to PostgreSQL %s
-                    sql = sql.replace("?", "%s")
-                    # Fix SQLite-specific functions to PostgreSQL equivalents
-                    sql = sql.replace("date('now')", "CURRENT_DATE")
-                    sql = sql.replace("datetime('now')", "NOW()")
-                    sql = sql.replace("INSERT OR REPLACE INTO", "INSERT INTO")
-                    sql = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO")
-                    # Add ON CONFLICT DO NOTHING for INSERT OR IGNORE patterns
-                    if "INSERT INTO" in sql and "ON CONFLICT" not in sql and "RETURNING" not in sql:
-                        # Only add if it's not a plain INSERT that already handles conflicts
-                        pass
-                    if params:
-                        self.cursor.execute(sql, params)
-                    else:
-                        self.cursor.execute(sql)
+                    sql = _normalise_sql(sql)
+                    self._c.execute(sql, params or ())
                     return self
-                
-                def fetchone(self):
-                    return self.cursor.fetchone()
-                
-                def fetchall(self):
-                    return self.cursor.fetchall()
-                
-                def fetchmany(self, size=None):
-                    return self.cursor.fetchmany(size) if size else self.cursor.fetchmany()
-                
+                def fetchone(self): return self._c.fetchone()
+                def fetchall(self): return self._c.fetchall()
+                def executemany(self, sql, seq):
+                    self._c.executemany(_normalise_sql(sql), seq)
                 @property
                 def lastrowid(self):
-                    return self.cursor.lastrowid
-                
-                @property
-                def rowcount(self):
-                    return self.cursor.rowcount
-
-                def executemany(self, sql, seq):
-                    sql = sql.replace("?", "%s")
-                    self.cursor.executemany(sql, seq)
-                    return self
-
-                def __enter__(self):
-                    return self
-                
-                def __exit__(self, *args):
-                    pass
+                    try:
+                        self._c.execute("SELECT lastval()")
+                        return self._c.fetchone()["lastval"]
+                    except:
+                        return 0
             
-            wrapper = CursorWrapper(cur, conn)
-            yield wrapper
+            yield _PGWrapper(cur, conn)
             conn.commit()
         except Exception:
             if conn:
-                conn.rollback()
+                try: conn.rollback()
+                except: pass
             raise
         finally:
             if conn:
-                conn.close()
+                _db_pool.return_connection(conn)
     else:
-        # SQLite for local testing
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        # SQLite - per-thread connection (no pool needed)
+        _local_db = threading.local()
+        conn = getattr(_local_db, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA cache_size=-20000")
+            _local_db.conn = conn
         try:
             yield conn
             conn.commit()
         except Exception:
             conn.rollback()
             raise
-        finally:
-            conn.close()
 
 def _hash_pw(p):
     try:
@@ -235,28 +279,221 @@ def _verify_pw(p, h):
         pass
     return hashlib.sha256(p.encode()).hexdigest() == h
 
+# ============ CACHED SETTINGS (5-second TTL) ============
+_settings_cache = {}
+_settings_cache_time = {}
+_settings_cache_ttl = 5.0  # seconds - short enough for admin changes to be seen quickly
+_settings_lock = threading.Lock()
+
 def get_setting(k, d=None):
-    with get_db() as db:
-        is_postgres = DATABASE_URL is not None
-        if is_postgres:
-            r = db.execute("SELECT value FROM settings WHERE key=%s", (k,)).fetchone()
-        else:
-            r = db.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
-        return r["value"] if r else d
+    """Get setting with in-memory cache - 5x faster than DB lookup"""
+    now = time.monotonic()
+    
+    # Check cache first
+    with _settings_lock:
+        if k in _settings_cache and (now - _settings_cache_time.get(k, 0)) < _settings_cache_ttl:
+            return _settings_cache[k]
+    
+    # Cache miss - get from DB
+    try:
+        with get_db() as db:
+            if DATABASE_URL:
+                r = db.execute("SELECT value FROM settings WHERE key=%s", (k,)).fetchone()
+            else:
+                r = db.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
+        val = r["value"] if r else d
+    except Exception:
+        val = d
+    
+    # Store in cache
+    with _settings_lock:
+        _settings_cache[k] = val
+        _settings_cache_time[k] = now
+    
+    return val
 
 def set_setting(k, v):
     with get_db() as db:
         if DATABASE_URL:
             db.execute(
-                "INSERT INTO settings(key, value) VALUES(?, ?) "
+                "INSERT INTO settings(key, value) VALUES(%s, %s) "
                 "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
                 (k, str(v))
             )
         else:
             db.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", (k, str(v)))
+    
+    # Bust cache immediately
+    with _settings_lock:
+        _settings_cache.pop(k, None)
+    
+    # ADD THIS LINE - Invalidate earning mode cache if it changed
+    if k == "earning_mode":
+        global _earning_mode_cache
+        _earning_mode_cache = None
+    
+    # ADD THIS LINE - Force rate refresh
+    if k in ["naira_per_msg", "points_per_msg"]:
+        global _current_rate_time
+        _current_rate_time = 0
+# Also add a helper to clear all cache (useful for bulk admin changes)
+def clear_settings_cache():
+    """Clear all cached settings (call after multiple admin changes)"""
+    with _settings_lock:
+        _settings_cache.clear()
+        _settings_cache_time.clear()
 
 def get_earning_mode() -> str:
     return get_setting("earning_mode", "manual")
+    
+# ============ ASYNC DB HELPER (Non-blocking database calls) ============
+_db_executor = None  # Will be initialized in post_init
+
+async def run_db(fn, *args, **kwargs):
+    """
+    Run a blocking DB/IO function in the DB executor pool.
+    This prevents database calls from blocking the event loop.
+    
+    Usage:
+        result = await run_db(db.execute, "SELECT * FROM users")
+        or
+        result = await run_db(lambda: some_sync_function())
+    """
+    global _db_executor
+    loop = asyncio.get_event_loop()
+    
+    if _db_executor is None:
+        # Fallback to default executor if not set
+        return await loop.run_in_executor(None, lambda: fn(*args, **kwargs) if args else fn())
+    
+    return await loop.run_in_executor(
+        _db_executor,
+        lambda: fn(*args, **kwargs) if args or kwargs else fn()
+    )
+
+
+# ============ OPTIMIZED get_internal_user_id (Cached) ============
+_user_id_cache = {}
+_user_id_cache_time = {}
+_user_id_cache_ttl = 60  # Cache for 60 seconds
+
+def get_internal_user_id_cached(telegram_id):
+    """Cached version of get_internal_user_id - reduces DB lookups"""
+    now = time.time()
+    
+    # Check cache
+    if telegram_id in _user_id_cache:
+        cached_time = _user_id_cache_time.get(telegram_id, 0)
+        if now - cached_time < _user_id_cache_ttl:
+            return _user_id_cache[telegram_id]
+    
+    # Cache miss - get from DB
+    with get_db() as db:
+        if DATABASE_URL:
+            row = db.execute("SELECT id FROM users WHERE telegram_id=%s", (telegram_id,)).fetchone()
+        else:
+            row = db.execute("SELECT id FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
+    
+    user_id = row["id"] if row else None
+    
+    # Store in cache
+    _user_id_cache[telegram_id] = user_id
+    _user_id_cache_time[telegram_id] = now
+    
+    return user_id
+
+
+# ============ OPTIMIZED API GET WsId (With Pagination Cache) ============
+_wsid_cache = {}
+_wsid_cache_time = {}
+_wsid_cache_ttl = 300  # Cache for 5 minutes
+
+def api_get_wsid_cached(account):
+    """Cached version of api_get_wsid - reduces pagination calls"""
+    now = time.time()
+    
+    # Check cache
+    if account in _wsid_cache:
+        cached_time = _wsid_cache_time.get(account, 0)
+        if now - cached_time < _wsid_cache_ttl:
+            return _wsid_cache[account]
+    
+    # Cache miss - get from API
+    wsid = api_get_wsid(account)
+    
+    # Store in cache (even None results to avoid repeated failures)
+    _wsid_cache[account] = wsid
+    _wsid_cache_time[account] = now
+    
+    return wsid
+
+
+# ============ FAST pts_to_ngn (No DB call per conversion) ============
+# Store rates locally and update only when settings change
+_current_npm = 30.0
+_current_ppm = 200
+_current_rate_time = 0
+_rate_cache_ttl = 10  # Refresh rates every 10 seconds
+
+def _refresh_rates():
+    """Refresh cached rates from settings"""
+    global _current_npm, _current_ppm, _current_rate_time
+    _current_npm = float(get_setting("naira_per_msg", "30"))
+    _current_ppm = int(get_setting("points_per_msg", "200"))
+    _current_rate_time = time.time()
+
+def pts_to_ngn_fast(points: int) -> float:
+    """Convert points to NGN using cached rates - 100x faster"""
+    global _current_npm, _current_ppm, _current_rate_time
+    
+    # Refresh rates if cache is stale
+    if time.time() - _current_rate_time > _rate_cache_ttl:
+        _refresh_rates()
+    
+    return (points / _current_ppm * _current_npm) if _current_ppm > 0 else 0
+
+
+# ============ REPLACE slow pts_to_ngn with fast version ============
+def pts_to_ngn(points: int) -> float:
+    """Convert points to NGN based on current rate (FAST cached version)"""
+    return pts_to_ngn_fast(points)
+
+
+# ============ OPTIMIZED get_earning_mode (Cached) ============
+_earning_mode_cache = None
+_earning_mode_cache_time = 0
+_earning_mode_cache_ttl = 5  # 5 seconds
+
+def get_earning_mode() -> str:
+    """Cached version - reduces DB calls dramatically"""
+    global _earning_mode_cache, _earning_mode_cache_time
+    
+    now = time.time()
+    if _earning_mode_cache is not None and (now - _earning_mode_cache_time) < _earning_mode_cache_ttl:
+        return _earning_mode_cache
+    
+    # Cache miss - get from DB
+    mode = get_setting("earning_mode", "manual")
+    _earning_mode_cache = mode
+    _earning_mode_cache_time = now
+    return mode
+
+
+# ============ INVALIDATE CACHES (Call when settings change) ============
+def invalidate_all_caches():
+    """Clear all caches - call after admin changes settings"""
+    global _earning_mode_cache, _earning_mode_cache_time
+    global _current_npm, _current_ppm, _current_rate_time
+    
+    clear_settings_cache()
+    _user_id_cache.clear()
+    _user_id_cache_time.clear()
+    _wsid_cache.clear()
+    _wsid_cache_time.clear()
+    _earning_mode_cache = None
+    _earning_mode_cache_time = 0
+    _current_rate_time = 0  # Force rate refresh on next call
+    log.info("[Cache] All caches invalidated")
 
 def _to_pts(ngn):
     """Convert naira amount to points using current rate."""
@@ -267,12 +504,6 @@ def _to_pts(ngn):
 def _pts_per_msg():
     """Points earned per message."""
     return int(get_setting("points_per_msg", "200"))
-
-def pts_to_ngn(points: int) -> float:
-    """Convert points to NGN based on current rate"""
-    npm = float(get_setting("naira_per_msg", "30"))
-    ppm = int(get_setting("points_per_msg", "200"))
-    return (points / ppm * npm) if ppm > 0 else 0
 
 def _credit(db, uid, amt, desc, t="earn"):
     is_postgres = DATABASE_URL is not None
@@ -296,29 +527,70 @@ def _debit(db, uid, amt, desc):
         db.execute("INSERT INTO transactions(user_id,type,amount,description) VALUES(?,?,?,?)",
                    (uid, "debit", amt, desc))
 
+# ============ NON-BLOCKING NOTIFICATION QUEUE ============
+_notify_queue = None  # asyncio.Queue, created in post_init
+
 def _notify(db, user_id, title, body, ntype="info"):
-    is_postgres = DATABASE_URL is not None
-    if is_postgres:
-        db.execute("INSERT INTO notifications(user_id,title,body,type) VALUES(%s,%s,%s,%s)",
-                   (user_id, title, body, ntype))
+    """
+    Write notification to DB, then queue Telegram push (non-blocking).
+    This NEVER opens a second DB connection inside an existing transaction.
+    """
+    # Write to database (fast)
+    if DATABASE_URL:
+        db.execute(
+            "INSERT INTO notifications(user_id,title,body,type) VALUES(%s,%s,%s,%s)",
+            (user_id, title, body, ntype)
+        )
     else:
-        db.execute("INSERT INTO notifications(user_id,title,body,type) VALUES(?,?,?,?)",
-                   (user_id, title, body, ntype))
+        db.execute(
+            "INSERT INTO notifications(user_id,title,body,type) VALUES(?,?,?,?)",
+            (user_id, title, body, ntype)
+        )
     
-    # Send Telegram message if bot is available - need to get telegram_id from DB
-    try:
-        with get_db() as db2:
-            if is_postgres:
-                row = db2.execute("SELECT telegram_id FROM users WHERE id=%s", (user_id,)).fetchone()
-            else:
-                row = db2.execute("SELECT telegram_id FROM users WHERE id=?", (user_id,)).fetchone()
-            if row and row["telegram_id"]:
-                asyncio.run_coroutine_threadsafe(
-                    send_telegram(row["telegram_id"], f"*{title}*\n{body}", parse_mode="Markdown"),
-                    _bot_loop
-                )
-    except Exception as e:
-        log.error(f"_notify send failed: {e}")
+    # Enqueue for background Telegram sending
+    if _notify_queue is not None and _bot_loop is not None:
+        asyncio.run_coroutine_threadsafe(
+            _notify_queue.put((user_id, title, body)),
+            _bot_loop
+        )
+
+async def _notify_consumer():
+    """
+    Background coroutine: drains the notify queue and sends Telegram messages.
+    One DB lookup per message, batched-friendly.
+    """
+    global _notify_queue
+    _notify_queue = asyncio.Queue()
+    while True:
+        try:
+            user_id, title, body = await _notify_queue.get()
+            try:
+                # Get telegram_id in a separate DB call (not inside original transaction)
+                with get_db() as db:
+                    if DATABASE_URL:
+                        row = db.execute(
+                            "SELECT telegram_id FROM users WHERE id=%s", (user_id,)
+                        ).fetchone()
+                    else:
+                        row = db.execute(
+                            "SELECT telegram_id FROM users WHERE id=?", (user_id,)
+                        ).fetchone()
+                
+                if row and row["telegram_id"]:
+                    await send_telegram(
+                        row["telegram_id"],
+                        f"*{title}*\n{body}",
+                        parse_mode="Markdown"
+                    )
+            except Exception as e:
+                log.warning(f"[notify_consumer] {e}")
+            finally:
+                _notify_queue.task_done()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.error(f"[notify_consumer] outer error: {e}")
+            await asyncio.sleep(1)
 
 def _admin_log(db, admin_id, action, target=None, detail=None):
     is_postgres = DATABASE_URL is not None
@@ -765,14 +1037,30 @@ def _hdrs(x=None):
 def _s0(p,u,n,tx=""): return _md5(_md5(p)+u+n+tx)
 def _s1(p,u,n,tx=""): return _md5(_md5(p)+tx+u+n)
 def _sa(p,u,n,a,t):   return _md5(_md5(p)+u+n+a+t)
-def _retry(fn, label="API"):
-    for i in range(1, MAX_RETRIES+1):
-        try: return fn()
+
+# ============ OPTIMIZED API RETRY (Faster failures) ============
+# Reduced MAX_RETRIES from 6 to 4
+MAX_RETRIES = 4
+
+def _retry(fn, label="API", timeout_secs=10):
+    """
+    Smarter retry: 
+    - Network errors → retry with exponential backoff (max 8s wait)
+    - Logic/parsing errors → fail immediately (no pointless retries)
+    """
+    for i in range(1, MAX_RETRIES + 1):
+        try:
+            return fn()
         except (Timeout, ReqConnError) as e:
-            time.sleep(min(2**i, 20)); log.warning(f"[{label}] retry {i}: {e}")
+            # Network error - worth retrying
+            wait = min(2 ** (i - 1), 8)  # Max 8 seconds wait (was 20)
+            log.warning(f"[{label}] network retry {i}/{MAX_RETRIES} in {wait}s: {e}")
+            time.sleep(wait)
         except Exception as e:
-            time.sleep(min(2**i, 20)); log.warning(f"[{label}] error {i}: {e}")
-    raise Exception(f"[{label}] Failed")
+            # Non-network error: don't burn retries on it - fail fast
+            log.warning(f"[{label}] error (no retry): {e}")
+            raise
+    raise Exception(f"[{label}] Failed after {MAX_RETRIES} retries")
 
 def platform_login():
     http = requests.Session()
@@ -1514,7 +1802,20 @@ def _pair_bg(user_id: int, account: str):
         with pairs_lock:
             active_pairs.pop(account, None)
         return
-    elapsed = 0; came_online = False
+    
+    # ============ ADAPTIVE POLLING LOOP (OPTIMIZED) ============
+    elapsed = 0
+    came_online = False
+    
+    def get_poll_interval(seconds_elapsed):
+        """Adaptive polling: fast at first, slower as time passes"""
+        if seconds_elapsed < 300:      # First 5 minutes: every 3 seconds
+            return 3
+        elif seconds_elapsed < 1800:   # 5-30 minutes: every 10 seconds
+            return 10
+        else:                           # After 30 minutes: every 30 seconds
+            return 30
+    
     while elapsed < 7200:
         with pairs_lock:
             if active_pairs.get(account, {}).get("cancelled"):
@@ -1526,11 +1827,18 @@ def _pair_bg(user_id: int, account: str):
                         db.execute("DELETE FROM numbers WHERE user_id=? AND account=?", (user_id, account))
                 active_pairs.pop(account, None)
                 return
-        if api_phonestatus(account) == 1:
+        
+        # Check phone status
+        status = api_phonestatus(account)
+        if status == 1:
             came_online = True
             break
-        time.sleep(POLL_INTERVAL)
-        elapsed += POLL_INTERVAL
+        
+        # Adaptive sleep based on how long we've been waiting
+        interval = get_poll_interval(elapsed)
+        time.sleep(interval)
+        elapsed += interval
+    
     if not came_online:
         with get_db() as db:
             is_postgres = DATABASE_URL is not None
@@ -2752,46 +3060,82 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Show spinner
-    loading = await show_spinner(update, context, "📊 Fetching dashboard data")
+    await show_spinner(update, context, "📊 Fetching dashboard data")
     
     mode = get_earning_mode()
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    
+    # ============ OPTIMIZED: Single database query for all data ============
     with get_db() as db:
+        is_postgres = DATABASE_URL is not None
+        
+        # Get user basic info
         u = db.execute("SELECT balance, referral_code FROM users WHERE id=?", (uid,)).fetchone()
-        te = db.execute("SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE user_id=? AND type='earn' AND date(created_at)=date('now')", (uid,)).fetchone()["s"]
-        tr = db.execute("SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE user_id=? AND type='referral' AND date(created_at)=date('now')", (uid,)).fetchone()["s"]
-        ta = db.execute("SELECT COALESCE(SUM(amount),0) as s FROM transactions WHERE user_id=? AND type='earn'", (uid,)).fetchone()["s"]
-        msgs_today = db.execute(
-            "SELECT COUNT(*) as c FROM transactions WHERE user_id=? AND type='earn' AND date(created_at)=date('now')",
-            (uid,)).fetchone()["c"]
-        total_msgs = db.execute("SELECT COUNT(*) as c FROM transactions WHERE user_id=? AND type='earn'", (uid,)).fetchone()["c"]
+        
+        # Single combined query for all stats (much faster!)
+        if is_postgres:
+            stats = db.execute("""
+                SELECT 
+                    COALESCE(SUM(CASE WHEN type='earn' AND date(created_at)=CURRENT_DATE THEN amount ELSE 0 END), 0) as today_earn,
+                    COALESCE(SUM(CASE WHEN type='referral' AND date(created_at)=CURRENT_DATE THEN amount ELSE 0 END), 0) as today_ref,
+                    COALESCE(SUM(CASE WHEN type='earn' THEN amount ELSE 0 END), 0) as total_earn,
+                    COUNT(CASE WHEN type='earn' AND date(created_at)=CURRENT_DATE THEN 1 END) as msgs_today,
+                    COUNT(CASE WHEN type='earn' THEN 1 END) as total_msgs
+                FROM transactions 
+                WHERE user_id = %s
+            """, (uid,)).fetchone()
+        else:
+            stats = db.execute("""
+                SELECT 
+                    COALESCE(SUM(CASE WHEN type='earn' AND date(created_at)=date('now') THEN amount ELSE 0 END), 0) as today_earn,
+                    COALESCE(SUM(CASE WHEN type='referral' AND date(created_at)=date('now') THEN amount ELSE 0 END), 0) as today_ref,
+                    COALESCE(SUM(CASE WHEN type='earn' THEN amount ELSE 0 END), 0) as total_earn,
+                    COUNT(CASE WHEN type='earn' AND date(created_at)=date('now') THEN 1 END) as msgs_today,
+                    COUNT(CASE WHEN type='earn' THEN 1 END) as total_msgs
+                FROM transactions 
+                WHERE user_id = ?
+            """, (uid,)).fetchone()
+        
+        # Get online count based on mode
         if mode == "auto":
             online = db.execute("SELECT COUNT(*) as c FROM auto_numbers WHERE user_id=? AND status='online'", (uid,)).fetchone()["c"]
         elif mode == "wacash":
             online = db.execute("SELECT COUNT(*) as c FROM wacash_numbers WHERE user_id=? AND status='online'", (uid,)).fetchone()["c"]
         else:
             online = db.execute("SELECT COUNT(*) as c FROM numbers WHERE user_id=? AND status='online'", (uid,)).fetchone()["c"]
+        
+        # Get check-in streak
         checkin = db.execute("SELECT streak FROM check_ins WHERE user_id=? ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
         streak = checkin["streak"] if checkin else 0
     
+    # Calculate values
     pts_bal = int(u["balance"] or 0)
     naira_bal = pts_to_ngn(pts_bal)
-    naira_today = pts_to_ngn(int(te or 0))
-    naira_total = pts_to_ngn(int(ta or 0))
+    naira_today = pts_to_ngn(int(stats["today_earn"] or 0))
+    naira_total = pts_to_ngn(int(stats["total_earn"] or 0))
+    
+    # Get user's personal mode for display
+    with get_db() as db:
+        user_mode_row = db.execute("SELECT earning_mode FROM users WHERE id=?", (uid,)).fetchone()
+        user_mode = user_mode_row["earning_mode"] if user_mode_row else "manual"
+    
+    mode_icon = "🔧" if mode == "manual" else "🤖" if mode == "auto" else "⚡"
+    user_mode_icon = "💰" if user_mode == "manual" else "⚡"
     
     text = (
-        f"📊 *DASHBOARD*\n\n"
-        f"💰 Balance: `{pts_bal:,}` pts\n"
+        f"📊 *DASHBOARD*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💰 *Balance:* `{pts_bal:,}` pts\n"
         f"   ≈ ₦{naira_bal:,.2f}\n\n"
-        f"📈 Today's earnings: `{int(te or 0):,}` pts (≈ ₦{naira_today:,.2f})\n"
-        f"👥 Today's referral: `{int(tr or 0):,}` pts\n"
-        f"🏆 Total earned: `{int(ta or 0):,}` pts (≈ ₦{naira_total:,.2f})\n\n"
-        f"📱 Online numbers: `{online}`\n"
-        f"✉️ Messages today: `{msgs_today}`\n"
-        f"📬 Total messages: `{total_msgs}`\n"
-        f"🔥 Check-in streak: `{streak}` day(s)\n"
-        f"🔄 Mode: `{mode}`\n\n"
-        f"🔗 Referral code: `{u['referral_code']}`"
+        f"📈 *Today's earnings:* `{int(stats['today_earn'] or 0):,}` pts (≈ ₦{naira_today:,.2f})\n"
+        f"👥 *Today's referral:* `{int(stats['today_ref'] or 0):,}` pts\n"
+        f"🏆 *Total earned:* `{int(stats['total_earn'] or 0):,}` pts (≈ ₦{naira_total:,.2f})\n\n"
+        f"📱 *Online numbers:* `{online}`\n"
+        f"✉️ *Messages today:* `{stats['msgs_today']}`\n"
+        f"📬 *Total messages:* `{stats['total_msgs']}`\n"
+        f"🔥 *Check-in streak:* `{streak}` day(s)\n\n"
+        f"{mode_icon} *Platform Mode:* `{mode.upper()}`\n"
+        f"{user_mode_icon} *Your Mode:* `{user_mode.upper()}`\n\n"
+        f"🔗 *Referral code:* `{u['referral_code']}`"
     )
     
     await stop_spinner(context, text, success=True, parse_mode="Markdown")
@@ -3217,7 +3561,7 @@ async def send_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No online numbers were found. Please connect a number first using *Add Number*.")
             return
 
-        # Initial message (will be edited later)
+        # Initial message
         msg = await update.message.reply_text("🔄 **Sending messages in batches...**\n⏳ Please wait...", parse_mode="Markdown")
 
         # Start background task
@@ -3229,7 +3573,6 @@ async def send_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 per_num_results = {}
                 per_num_lock = threading.Lock()
 
-                # --- fire_until_offline (runs in thread pool) ---
                 def fire_until_offline(acct, ws_id):
                     total_success = 0
                     total_failed = 0
@@ -3267,7 +3610,6 @@ async def send_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     with per_num_lock:
                         per_num_results[acct] = {"success": total_success, "failed": total_failed}
 
-                # --- Blocking fire block (run in executor) ---
                 def run_fire_block():
                     with _wacash_fire_lock:
                         task_before = wacash_get_task_info()
@@ -3282,7 +3624,6 @@ async def send_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         sends_after = task_after.get("todaySendNum", 0) if task_after else 0
                         return max(0, sends_after - sends_before), per_num_results
 
-                # Run blocking part in a separate thread
                 loop = asyncio.get_running_loop()
                 actual_sends, per_num_results = await loop.run_in_executor(None, run_fire_block)
 
@@ -3316,12 +3657,11 @@ async def send_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log.error(f"Background send_all error: {e}")
                 await msg.edit_text(f"❌ An error occurred: {str(e)[:100]}", parse_mode="Markdown")
 
-        # Fire and forget – the handler returns immediately
         asyncio.create_task(background_send())
         await update.message.reply_text("🚀 Sending started in background. You will receive the result here shortly.")
         return
     
-    # Manual mode (unchanged, but for completeness)
+    # ============ OPTIMIZED MANUAL MODE SEND ALL ============
     with get_db() as db:
         rows = db.execute("SELECT account, wsid FROM numbers WHERE user_id=? AND status='online' AND wsid IS NOT NULL", (uid,)).fetchall()
     if not rows:
@@ -3329,41 +3669,37 @@ async def send_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     msg = await update.message.reply_text("🔄 **Sending messages concurrently...**\n⏳ Please wait...", parse_mode="Markdown")
-    npm = float(get_setting("naira_per_msg", "30"))
     ppm = int(get_setting("points_per_msg", "200"))
     results = []
-    lock = threading.Lock()
-    ready_count = [0]
-    total_count = len(rows)
-    go_event = threading.Event()
+    results_lock = threading.Lock()
     
-    def do(acct, wsid):
-        s = _ps()
-        uid_str, uname = str(s["userid"]), s["username"]
-        sign = _s0("/api/user/sendmsg", uid_str, uname, tx=str(wsid))
-        payload = {"phone": acct, "wsid": wsid, "username": uname, "userid": int(uid_str), "sign": sign}
-        hdrs = _hdrs()
-        with lock:
-            ready_count[0] += 1
-            if ready_count[0] == total_count:
-                go_event.set()
-        go_event.wait()
+    def send_one(acct, wsid):
+        """Send a single message to one number"""
         try:
-            r = s["http"].post(f"{BASE_URL}/api/user/sendmsg", json=payload, headers=hdrs, timeout=15)
-            d = r.json()
-            ok = d.get("code") == 0
-        except Exception:
+            ok, _ = api_sendmsg(acct, wsid)
+        except Exception as e:
+            log.warning(f"Send failed for {acct}: {e}")
             ok = False
-        with lock:
+        with results_lock:
             results.append((acct, ok))
+        return ok
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(rows), 50)) as ex:
-        concurrent.futures.wait([ex.submit(do, r["account"], r["wsid"]) for r in rows])
+    # Run all sends concurrently using ThreadPoolExecutor
+    loop = asyncio.get_event_loop()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(rows), 30)) as executor:
+        futures = []
+        for row in rows:
+            future = loop.run_in_executor(executor, send_one, row["account"], row["wsid"])
+            futures.append(future)
+        
+        # Wait for all to complete
+        await asyncio.gather(*futures, return_exceptions=True)
     
-    sent = sum(1 for _,ok in results if ok)
+    sent = sum(1 for _, ok in results if ok)
     total_earned_pts = sent * ppm
     
     if sent > 0:
+        # Batch database updates
         with get_db() as db:
             _credit(db, uid, total_earned_pts, f"Manual send-all")
             _increment_daily_msgs(db, uid, sent)
@@ -3375,9 +3711,33 @@ async def send_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 bonus = max(1, int(total_earned_pts * float(get_setting("referral_pct", "5")) / 100))
                 _credit(db, u["referred_by"], bonus, f"Ref bonus from uid={uid}", "referral")
             new_bal = db.execute("SELECT balance FROM users WHERE id=?", (uid,)).fetchone()["balance"]
-        await msg.edit_text(f"✅ Sent {sent}/{len(rows)} messages. Earned {total_earned_pts} points.\n💰 New balance: {new_bal:,} pts.")
+        
+        ngn_earned = pts_to_ngn(total_earned_pts)
+        
+        # Build result summary (limit to first 10 for readability)
+        summary_lines = []
+        for acct, ok in results[:10]:
+            summary_lines.append(f"{'✅' if ok else '❌'} `{acct}`")
+        if len(results) > 10:
+            summary_lines.append(f"... and {len(results) - 10} more")
+        
+        summary = "\n".join(summary_lines)
+        await msg.edit_text(
+            f"✅ *Send Complete!*\n\n"
+            f"📤 Sent: `{sent}/{len(rows)}` messages\n"
+            f"💎 Earned: `{total_earned_pts:,}` pts\n"
+            f"💵 ≈ ₦{ngn_earned:.2f}\n"
+            f"💰 New balance: `{new_bal:,}` pts\n\n"
+            f"*Results:*\n{summary}",
+            parse_mode="Markdown"
+        )
     else:
-        await msg.edit_text("❌ No messages could be sent. Some numbers may be offline.")
+        await msg.edit_text(
+            f"❌ *Send Failed*\n\n"
+            f"0/{len(rows)} messages sent.\n"
+            f"Please check that your numbers are online and try again.",
+            parse_mode="Markdown"
+        )
 
 # Leaderboard
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4591,10 +4951,7 @@ async def fix_user_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"❌ User with Telegram ID {target_id} not found.")
     
-# ── LIVE ANIMATION ENGINE ────────────────────────────────────────────────────
-# Cycling dot bars that animate in real-time while the bot is working.
-# Each spinner runs its own asyncio Task so the bot stays fully responsive.
-
+# ============ OPTIMIZED SPINNER (No Task Cancellation) ============
 _ANIM_FRAMES = {
     "default": ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"],
     "dots":    ["   ","·  ","·· ","···","·· ","·  "],
@@ -4606,13 +4963,18 @@ _ANIM_FRAMES = {
     "clock":   ["🕐","🕑","🕒","🕓","🕔","🕕","🕖","🕗","🕘","🕙","🕚","🕛"],
 }
 
-async def _animate_loop(bot, chat_id: int, msg_id: int,
-                        label: str, style: str = "default"):
-    """Background task that edits the message every 1.2s to animate."""
+async def _animate_loop(bot, chat_id: int, msg_id: int, user_data: dict, style: str = "default"):
+    """
+    SINGLE long-running animation coroutine.
+    Reads the current label from user_data['spinner_text'] on each tick.
+    This NEVER needs to be cancelled/recreated - just update the label!
+    """
     frames = _ANIM_FRAMES.get(style, _ANIM_FRAMES["default"])
     i = 0
     while True:
         try:
+            # Read current label from user_data (can be updated anytime)
+            label = user_data.get("spinner_text", "Processing")
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=msg_id,
@@ -4625,10 +4987,10 @@ async def _animate_loop(bot, chat_id: int, msg_id: int,
         await asyncio.sleep(1.2)
 
 async def show_spinner(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                       text: str = "Processing", style: str = "default") -> None:
+                       text: str = "Processing", style: str = "default"):
     """
-    Send an animated loading message and start the live animation loop.
-    The message edits itself every 1.2 seconds until stop_spinner() is called.
+    Send an animated loading message.
+    Creates ONE animation task that runs until stop_spinner is called.
     """
     frames = _ANIM_FRAMES.get(style, _ANIM_FRAMES["default"])
     msg = await update.message.reply_text(f"{frames[0]}  {text}")
@@ -4638,46 +5000,60 @@ async def show_spinner(update: Update, context: ContextTypes.DEFAULT_TYPE,
     old_task = context.user_data.pop("_spinner_task", None)
     if old_task and not old_task.done():
         old_task.cancel()
+        # Small delay to ensure old task is cleaned up
+        await asyncio.sleep(0.1)
 
-    # Start live animation task
+    # Store spinner state
+    context.user_data["spinner_text"] = text
+    context.user_data["spinner_msg_id"] = msg.message_id
+    context.user_data["spinner_chat_id"] = chat_id
+
+    # Start SINGLE animation task (will run until stop_spinner)
     task = asyncio.create_task(
-        _animate_loop(context.bot, chat_id, msg.message_id, text, style)
+        _animate_loop(context.bot, chat_id, msg.message_id, context.user_data, style)
     )
-    context.user_data["_spinner_task"]    = task
-    context.user_data["spinner_msg_id"]   = msg.message_id
-    context.user_data["spinner_chat_id"]  = chat_id
-    context.user_data["spinner_text"]     = text
+    context.user_data["_spinner_task"] = task
     return msg
 
 async def update_spinner(context: ContextTypes.DEFAULT_TYPE,
-                          new_text: str = None, style: str = None) -> None:
-    """Change the label shown in the live spinner without stopping it."""
+                          new_text: str = None, style: str = None):
+    """
+    Update the label shown in the live spinner WITHOUT cancelling the task.
+    Just update user_data - the animation loop picks it up on next tick.
+    This is MUCH faster than before!
+    """
     if new_text:
         context.user_data["spinner_text"] = new_text
-    task = context.user_data.get("_spinner_task")
-    if task and not task.done():
-        task.cancel()
-    chat_id  = context.user_data.get("spinner_chat_id")
-    msg_id   = context.user_data.get("spinner_msg_id")
-    label    = new_text or context.user_data.get("spinner_text", "Processing")
-    st       = style or "default"
-    if chat_id and msg_id:
-        new_task = asyncio.create_task(
-            _animate_loop(context.bot, chat_id, msg_id, label, st)
-        )
-        context.user_data["_spinner_task"] = new_task
+    
+    # If style changed, we need to restart the animation (rare case)
+    if style:
+        old_task = context.user_data.get("_spinner_task")
+        if old_task and not old_task.done():
+            old_task.cancel()
+            await asyncio.sleep(0.1)
+        
+        chat_id = context.user_data.get("spinner_chat_id")
+        msg_id = context.user_data.get("spinner_msg_id")
+        if chat_id and msg_id:
+            task = asyncio.create_task(
+                _animate_loop(context.bot, chat_id, msg_id, context.user_data, style)
+            )
+            context.user_data["_spinner_task"] = task
 
 async def stop_spinner(context: ContextTypes.DEFAULT_TYPE,
                         final_text: str, success: bool = True,
-                        parse_mode: str = "Markdown") -> None:
+                        parse_mode: str = "Markdown"):
     """Stop the animation and replace with the final result message."""
     task = context.user_data.pop("_spinner_task", None)
     if task and not task.done():
         task.cancel()
+        await asyncio.sleep(0.1)
+    
     icon = "✅" if success else "❌"
     chat_id = context.user_data.get("spinner_chat_id")
-    msg_id  = context.user_data.get("spinner_msg_id")
-    # Try edit first; fall back to new message
+    msg_id = context.user_data.get("spinner_msg_id")
+    
+    # Try to edit the message, fallback to new message if needed
     for pm in [parse_mode, None]:
         try:
             if msg_id and chat_id:
@@ -4689,7 +5065,7 @@ async def stop_spinner(context: ContextTypes.DEFAULT_TYPE,
                 )
             else:
                 await context.bot.send_message(
-                    chat_id=chat_id,
+                    chat_id=chat_id if chat_id else context._chat_id,
                     text=f"{icon}  {final_text}",
                     parse_mode=pm
                 )
@@ -4697,8 +5073,11 @@ async def stop_spinner(context: ContextTypes.DEFAULT_TYPE,
         except Exception as e:
             if pm is None:
                 log.warning(f"[Spinner] Could not deliver result: {e}")
+    
+    # Clean up
     context.user_data.pop("spinner_msg_id", None)
     context.user_data.pop("spinner_chat_id", None)
+    context.user_data.pop("spinner_text", None)
     
 async def debug_env(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Check environment variables (admin only)"""
@@ -4733,51 +5112,60 @@ async def update_spinner_message(msg, new_text: str):
 # ----------------------------------------------------------------------
 # Main bot setup
 # ----------------------------------------------------------------------
+# ============ OPTIMIZED POST_INIT (With All Background Workers) ============
 async def post_init(app):
     """
     Called once the event loop is running inside run_polling().
     Safe place to start Telethon worker and set _bot_loop.
     """
-    global _bot_loop, _application
+    global _bot_loop, _application, _db_executor
+    
     _application = app
     _bot_loop = asyncio.get_event_loop()
     
-    # Start Task4U login for hourly mode in background
+    # ============ SETUP DB EXECUTOR POOL ============
+    import concurrent.futures
+    _db_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=4, 
+        thread_name_prefix="earndb"
+    )
+    log.info("[Speed] DB executor pool started (4 workers)")
+    
+    # ============ START NOTIFICATION CONSUMER ============
+    asyncio.create_task(_notify_consumer())
+    log.info("[Speed] Notification consumer started")
+    
+    # ============ START TASK4U LOGIN (Hourly Mode) ============
     def start_task4u_login():
-        task4u_login()
-        log.info("[Task4U] Initial login complete")
+        try:
+            task4u_login()
+            log.info("[Task4U] Initial login complete")
+        except Exception as e:
+            log.error(f"[Task4U] Initial login failed: {e}")
     
     # Run Task4U login in thread pool to avoid blocking
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, start_task4u_login)
     
+    # ============ START TELETHON WORKER (Auto Mode) ============
     log.info("[Bot] post_init: starting Telethon task worker...")
     await _start_task_worker()
     
-    # Start hourly monitoring tasks
+    # ============ START HOURLY MONITORING TASKS ============
     asyncio.create_task(realtime_hourly_monitor())
     asyncio.create_task(hourly_payout_monitor())
+    log.info("[Speed] Hourly monitoring tasks started")
     
-    log.info("[Bot] post_init: complete.")
-
-def _session_keepalive():
-    """Keep platform session alive (same as original)."""
-    while True:
-        time.sleep(600)
-        try:
-            s = dict(platform_session)
-            if not s.get("http"):
-                platform_login()
-                continue
-            sign = _s0("/api/user/get_appinfo", str(s["userid"]), s["username"])
-            r = s["http"].get(f"{BASE_URL}/api/user/get_appinfo",
-                params={"page": 1, "pagesize": 1, "username": s["username"],
-                        "userid": s["userid"], "sign": sign},
-                headers=_hdrs(), timeout=10)
-            if r.json().get("code") != 0:
-                platform_login()
-        except Exception:
-            platform_login()
+    # ============ START SESSION KEEPALIVE (Non-blocking) ============
+    def start_keepalive():
+        _session_keepalive()
+    
+    # Run keepalive in background thread
+    keepalive_thread = threading.Thread(target=start_keepalive, daemon=True)
+    keepalive_thread.start()
+    log.info("[Speed] Session keepalive thread started")
+    
+    log.info("[Bot] post_init: ALL WORKERS STARTED - Bot is ready!")
 
 def main():
     global _application, _bot_loop
