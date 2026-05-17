@@ -4239,15 +4239,33 @@ async def check_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Unauthorized.")
         return
     
-    with get_db() as db:
-        result = db.execute("SELECT version() as ver").fetchone()
-        await update.message.reply_text(
-            f"✅ **Database Connected!**\n\n"
-            f"Type: PostgreSQL\n"
-            f"Version: {result['ver'][:50]}...\n\n"
-            f"Your data will now persist forever! 🎉",
-            parse_mode="Markdown"
-        )
+    try:
+        with get_db() as db:
+            # Check which database we're using
+            is_postgres = DATABASE_URL is not None
+            
+            if is_postgres:
+                result = db.execute("SELECT version() as ver").fetchone()
+                version = result['ver'][:50]
+                db_type = "PostgreSQL"
+            else:
+                result = db.execute("SELECT sqlite_version() as ver").fetchone()
+                version = result['ver']
+                db_type = "SQLite (⚠️ Data will NOT persist!)"
+            
+            # Count users to verify data persistence
+            user_count = db.execute("SELECT COUNT(*) as c FROM users").fetchone()['c']
+            
+            await update.message.reply_text(
+                f"✅ **Database Connected!**\n\n"
+                f"📦 **Type:** {db_type}\n"
+                f"🔢 **Users:** {user_count}\n"
+                f"🆔 **Version:** {version}\n\n"
+                f"{'🎉 Your data will persist forever across redeployments!' if is_postgres else '⚠️ WARNING: Using SQLite - data will be lost on redeploy!'}",
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Database error: {str(e)[:200]}")
     
 async def test_wacash_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Test WorkGo1 API directly"""
