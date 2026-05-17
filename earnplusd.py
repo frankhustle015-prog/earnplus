@@ -2541,18 +2541,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = user.id
     
     with get_db() as db:
-        db_user = db.execute("SELECT id, is_admin, earning_mode FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
+        is_postgres = DATABASE_URL is not None
+        
+        if is_postgres:
+            db_user = db.execute("SELECT id, is_admin, earning_mode FROM users WHERE telegram_id=%s", (telegram_id,)).fetchone()
+        else:
+            db_user = db.execute("SELECT id, is_admin, earning_mode FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
+        
         if not db_user:
             # Create new user
             username = user.username or f"user{telegram_id}"
             ref_code = secrets.token_hex(5).upper()
             is_admin = 1 if telegram_id == ADMIN_TELEGRAM_ID else 0
             # New users start with NO earning_mode set (NULL)
-            db.execute(
-                "INSERT INTO users(telegram_id, username, password, referral_code, is_admin, earning_mode) VALUES(?,?,?,?,?, NULL)",
-                (telegram_id, username, _hash_pw("default"), ref_code, is_admin)
-            )
-            new_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+            if is_postgres:
+                db.execute(
+                    "INSERT INTO users(telegram_id, username, password, referral_code, is_admin, earning_mode) VALUES(%s,%s,%s,%s,%s, NULL)",
+                    (telegram_id, username, _hash_pw("default"), ref_code, is_admin)
+                )
+                new_id = db.execute("SELECT lastval() as id").fetchone()["id"]
+            else:
+                db.execute(
+                    "INSERT INTO users(telegram_id, username, password, referral_code, is_admin, earning_mode) VALUES(?,?,?,?,?, NULL)",
+                    (telegram_id, username, _hash_pw("default"), ref_code, is_admin)
+                )
+                new_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+            
             await send_telegram(telegram_id, f"Welcome {username}! Your account has been created.\n"
                                              f"Referral code: `{ref_code}`\n"
                                              f"Share it to earn bonuses.", parse_mode="Markdown")
@@ -2560,8 +2574,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             # Ensure is_admin matches Telegram ID
             if telegram_id == ADMIN_TELEGRAM_ID and not db_user["is_admin"]:
-                db.execute("UPDATE users SET is_admin=1 WHERE telegram_id=?", (telegram_id,))
-                db_user = db.execute("SELECT id, is_admin, earning_mode FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
+                if is_postgres:
+                    db.execute("UPDATE users SET is_admin=1 WHERE telegram_id=%s", (telegram_id,))
+                else:
+                    db.execute("UPDATE users SET is_admin=1 WHERE telegram_id=?", (telegram_id,))
+                
+                if is_postgres:
+                    db_user = db.execute("SELECT id, is_admin, earning_mode FROM users WHERE telegram_id=%s", (telegram_id,)).fetchone()
+                else:
+                    db_user = db.execute("SELECT id, is_admin, earning_mode FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
 
     context.user_data["user_id"] = db_user["id"]
     context.user_data["is_admin"] = db_user["is_admin"]
@@ -2643,9 +2664,14 @@ async def set_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = update.effective_user.id
     
     with get_db() as db:
-        db.execute("UPDATE users SET earning_mode = ? WHERE telegram_id = ?", (mode, telegram_id))
-        # Also update the user's data in context
-        user = db.execute("SELECT id, is_admin FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
+        is_postgres = DATABASE_URL is not None
+        if is_postgres:
+            db.execute("UPDATE users SET earning_mode = %s WHERE telegram_id = %s", (mode, telegram_id))
+            user = db.execute("SELECT id, is_admin FROM users WHERE telegram_id=%s", (telegram_id,)).fetchone()
+        else:
+            db.execute("UPDATE users SET earning_mode = ? WHERE telegram_id = ?", (mode, telegram_id))
+            user = db.execute("SELECT id, is_admin FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
+        
         if user:
             context.user_data["user_id"] = user["id"]
             context.user_data["is_admin"] = user["is_admin"]
