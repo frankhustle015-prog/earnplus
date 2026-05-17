@@ -2875,6 +2875,7 @@ admin_panel_buttons = [
     [InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
     [InlineKeyboardButton("👥 Users List", callback_data="admin_users")],
     [InlineKeyboardButton("✅ Approve Withdrawals", callback_data="admin_withdrawals")],
+    [InlineKeyboardButton("📜 All Withdrawals", callback_data="admin_all_withdrawals")],  # NEW
     [InlineKeyboardButton("💰 Credit User", callback_data="admin_credit")],
     [InlineKeyboardButton("⛔ Ban/Unban User", callback_data="admin_ban")],
     [InlineKeyboardButton("🔄 Switch Earning Mode", callback_data="admin_mode")],
@@ -4465,6 +4466,75 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             text += f"ID: `{w['id']}` | {w['username']} | ₦{w['amount']:.2f} | {w['method']} | {w['created_at'][:10]}\n"
         text += "\nTo approve/reject, use:\n/admin_withdraw <id> approve|reject [reason]"
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_panel_markup)
+        
+    elif data == "admin_all_withdrawals":
+       with get_db() as db:
+        # Get all withdrawals with user info, ordered by most recent
+        if DATABASE_URL:
+            withdrawals = db.execute("""
+                SELECT w.*, u.username, u.telegram_id 
+                FROM withdrawals w 
+                JOIN users u ON w.user_id = u.id 
+                ORDER BY w.created_at DESC 
+                LIMIT 100
+            """).fetchall()
+        else:
+            withdrawals = db.execute("""
+                SELECT w.*, u.username, u.telegram_id 
+                FROM withdrawals w 
+                JOIN users u ON w.user_id = u.id 
+                ORDER BY w.created_at DESC 
+                LIMIT 100
+            """).fetchall()
+    
+    if not withdrawals:
+        await query.edit_message_text("No withdrawals found.", reply_markup=admin_panel_markup)
+        return
+    
+    # Build message
+    text = "📜 *ALL WITHDRAWALS (Last 100)*\n"
+    text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    pending_count = 0
+    approved_count = 0
+    rejected_count = 0
+    total_amount = 0
+    
+    for w in withdrawals:
+        status = w["status"]
+        pts = int(w["pts_amount"] or 0)
+        amount = float(w["amount"] or 0)
+        username = w["username"][:15] if w["username"] else "Unknown"
+        created = w["created_at"][:16] if w["created_at"] else "Unknown"
+        
+        if status == "pending":
+            pending_count += 1
+            status_emoji = "⏳"
+            status_text = "PENDING"
+        elif status in ["approved", "done"]:
+            approved_count += 1
+            total_amount += amount
+            status_emoji = "✅"
+            status_text = "APPROVED"
+        else:
+            rejected_count += 1
+            status_emoji = "❌"
+            status_text = "REJECTED"
+        
+        text += f"{status_emoji} *WD#{w['id']}* | {username}\n"
+        text += f"   📅 {created}\n"
+        text += f"   💰 {pts:,} pts (≈ ₦{amount:.2f})\n"
+        text += f"   📊 {status_text}\n"
+        text += "\n"
+    
+    text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"📊 *Summary*\n"
+    text += f"⏳ Pending: {pending_count}\n"
+    text += f"✅ Approved: {approved_count} (≈ ₦{total_amount:.2f})\n"
+    text += f"❌ Rejected: {rejected_count}\n\n"
+    text += "💡 *Tip:* Use `/admin_withdraw <id> approve|reject` to process pending withdrawals."
+    
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_panel_markup)
 
     elif data == "admin_credit":
         await query.edit_message_text("Send the command: `/credit_user <user_id> <points>`\n(You can get user_id from /admin_users)",
