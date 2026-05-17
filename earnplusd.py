@@ -4955,66 +4955,66 @@ async def admin_command_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 log.error(f"Broadcast failed to {u['telegram_id']}: {e}")
         await update.message.reply_text(f"Broadcast sent to {sent} users.")
     elif text.startswith("/admin_withdraw"):
-    parts = text.split()
-    if len(parts) < 3:
-        await update.message.reply_text("Usage: /admin_withdraw <withdrawal_id> approve|reject [reason]")
-        return
-    
-    # Clean up HTML-encoded ID
-    raw_wd_id = parts[1].replace("&lt;", "").replace("&gt;", "").replace("<", "").replace(">", "")
-    
-    try:
-        wd_id = int(raw_wd_id)
-    except ValueError:
-        await update.message.reply_text(f"Invalid withdrawal ID: {parts[1]}\nUse number only (e.g., 1, 2, 3)")
-        return
-    
-    action = parts[2].lower()
-    reason = " ".join(parts[3:]) if len(parts) > 3 else None
-    
-    with get_db() as db:
-        # Get withdrawal with bank details
-        wd = db.execute("""
-            SELECT w.*, u.username, u.telegram_id,
-                   b.account_num, b.account_name, b.bank_name
-            FROM withdrawals w 
-            JOIN users u ON w.user_id = u.id
-            LEFT JOIN bank_details b ON u.id = b.user_id
-            WHERE w.id = ?
-        """, (wd_id,)).fetchone()
-        
-        if not wd:
-            await update.message.reply_text(f"Withdrawal #{wd_id} not found.")
-            return
-        if wd["status"] != "pending":
-            await update.message.reply_text(f"Withdrawal #{wd_id} is already {wd['status']}.")
+        parts = text.split()
+        if len(parts) < 3:
+            await update.message.reply_text("Usage: /admin_withdraw <withdrawal_id> approve|reject [reason]")
             return
         
-        # Build details for confirmation
-        details = f"\n📝 *Details:*\n"
-        details += f"👤 User: {wd['username']}\n"
-        details += f"💰 Amount: ₦{wd['amount']:.2f}\n"
+        # Clean up HTML-encoded ID
+        raw_wd_id = parts[1].replace("&lt;", "").replace("&gt;", "").replace("<", "").replace(">", "")
         
-        if wd["method"] == "bank":
-            details += f"🏦 Bank: {wd['bank_name'] or 'N/A'}\n"
-            details += f"🔢 Account: {wd['account_num'] or 'N/A'}\n"
-            details += f"👤 Name: {wd['account_name'] or 'N/A'}\n"
-        elif wd["method"] == "trx" and wd["wallet_addr"]:
-            details += f"💎 TRX Wallet: {wd['wallet_addr']}\n"
+        try:
+            wd_id = int(raw_wd_id)
+        except ValueError:
+            await update.message.reply_text(f"Invalid withdrawal ID: {parts[1]}\nUse number only (e.g., 1, 2, 3)")
+            return
         
-        if action == "approve":
-            db.execute("UPDATE withdrawals SET status='done', updated_at=datetime('now') WHERE id=?", (wd_id,))
-            _admin_log(db, get_internal_user_id(ADMIN_TELEGRAM_ID), "approve_withdrawal", f"WD#{wd_id}", None)
-            await send_telegram(wd["user_id"], f"✅ Your withdrawal of {wd['pts_amount']} points (≈ ₦{wd['amount']:.2f}) has been approved and is being processed.")
-            await update.message.reply_text(f"✅ Withdrawal #{wd_id} approved!{details}")
-        elif action == "reject":
-            db.execute("UPDATE withdrawals SET status='rejected', reason=?, updated_at=datetime('now') WHERE id=?", (reason or "Rejected by admin", wd_id))
-            _credit(db, wd["user_id"], wd["pts_amount"], f"Refund WD#{wd_id}")
-            _admin_log(db, get_internal_user_id(ADMIN_TELEGRAM_ID), "reject_withdrawal", f"WD#{wd_id}", reason)
-            await send_telegram(wd["user_id"], f"❌ Your withdrawal of {wd['pts_amount']} points was rejected. Reason: {reason or 'Rejected by admin'}. Points refunded.")
-            await update.message.reply_text(f"❌ Withdrawal #{wd_id} rejected.{details}")
-        else:
-            await update.message.reply_text("Action must be 'approve' or 'reject'")
+        action = parts[2].lower()
+        reason = " ".join(parts[3:]) if len(parts) > 3 else None
+        
+        with get_db() as db:
+            # Get withdrawal with bank details
+            wd = db.execute("""
+                SELECT w.*, u.username, u.telegram_id,
+                       b.account_num, b.account_name, b.bank_name
+                FROM withdrawals w 
+                JOIN users u ON w.user_id = u.id
+                LEFT JOIN bank_details b ON u.id = b.user_id
+                WHERE w.id = ?
+            """, (wd_id,)).fetchone()
+            
+            if not wd:
+                await update.message.reply_text(f"Withdrawal #{wd_id} not found.")
+                return
+            if wd["status"] != "pending":
+                await update.message.reply_text(f"Withdrawal #{wd_id} is already {wd['status']}.")
+                return
+            
+            # Build details for confirmation
+            details = f"\n📝 *Details:*\n"
+            details += f"👤 User: {wd['username']}\n"
+            details += f"💰 Amount: ₦{wd['amount']:.2f}\n"
+            
+            if wd["method"] == "bank":
+                details += f"🏦 Bank: {wd['bank_name'] or 'N/A'}\n"
+                details += f"🔢 Account: {wd['account_num'] or 'N/A'}\n"
+                details += f"👤 Name: {wd['account_name'] or 'N/A'}\n"
+            elif wd["method"] == "trx" and wd["wallet_addr"]:
+                details += f"💎 TRX Wallet: {wd['wallet_addr']}\n"
+            
+            if action == "approve":
+                db.execute("UPDATE withdrawals SET status='done', updated_at=datetime('now') WHERE id=?", (wd_id,))
+                _admin_log(db, get_internal_user_id(ADMIN_TELEGRAM_ID), "approve_withdrawal", f"WD#{wd_id}", None)
+                await send_telegram(wd["user_id"], f"✅ Your withdrawal of {wd['pts_amount']} points (≈ ₦{wd['amount']:.2f}) has been approved and is being processed.")
+                await update.message.reply_text(f"✅ Withdrawal #{wd_id} approved!{details}")
+            elif action == "reject":
+                db.execute("UPDATE withdrawals SET status='rejected', reason=?, updated_at=datetime('now') WHERE id=?", (reason or "Rejected by admin", wd_id))
+                _credit(db, wd["user_id"], wd["pts_amount"], f"Refund WD#{wd_id}")
+                _admin_log(db, get_internal_user_id(ADMIN_TELEGRAM_ID), "reject_withdrawal", f"WD#{wd_id}", reason)
+                await send_telegram(wd["user_id"], f"❌ Your withdrawal of {wd['pts_amount']} points was rejected. Reason: {reason or 'Rejected by admin'}. Points refunded.")
+                await update.message.reply_text(f"❌ Withdrawal #{wd_id} rejected.{details}")
+            else:
+                await update.message.reply_text("Action must be 'approve' or 'reject'")
 
 # Handle document import for admin
 async def handle_import_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
