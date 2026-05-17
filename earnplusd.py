@@ -3370,32 +3370,121 @@ async def my_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not uid:
         await update.message.reply_text("Please use /start to register before proceeding.")
         return
-    mode = get_earning_mode()
+    
+    # Get user's personal earning mode (hourly or manual)
+    with get_db() as db:
+        user_row = db.execute("SELECT earning_mode FROM users WHERE id=?", (uid,)).fetchone()
+        user_mode = user_row["earning_mode"] if user_row else "manual"
+    
+    # Get platform mode for wacash/auto handling
+    platform_mode = get_earning_mode()
+    
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    if mode == "wacash":
+    
+    # ============ FILTER BY USER'S MODE ============
+    if user_mode == "hourly":
+        # HOURLY MODE - only show numbers from numbers table
         with get_db() as db:
-            rows = db.execute("SELECT account, status, pair_code, msgs_sent, ws_id as wsid, added_at FROM wacash_numbers WHERE user_id=? ORDER BY added_at DESC", (uid,)).fetchall()
-    elif mode == "auto":
+            rows = db.execute("""
+                SELECT account, status, pair_code, msgs_sent, wsid, 
+                       hourly_status, hourly_start_time, total_hours_earned,
+                       platform_hours_at_start
+                FROM numbers 
+                WHERE user_id = ? 
+                ORDER BY added_at DESC
+            """, (uid,)).fetchall()
+    elif platform_mode == "wacash":
+        # WACASH PLATFORM MODE
         with get_db() as db:
-            rows = db.execute("SELECT account, status, pair_code, msgs_sent, added_at FROM auto_numbers WHERE user_id=? ORDER BY added_at DESC", (uid,)).fetchall()
+            rows = db.execute("""
+                SELECT account, status, pair_code, msgs_sent, ws_id as wsid, added_at 
+                FROM wacash_numbers 
+                WHERE user_id = ? 
+                ORDER BY added_at DESC
+            """, (uid,)).fetchall()
+    elif platform_mode == "auto":
+        # AUTO PLATFORM MODE
+        with get_db() as db:
+            rows = db.execute("""
+                SELECT account, status, pair_code, msgs_sent, added_at 
+                FROM auto_numbers 
+                WHERE user_id = ? 
+                ORDER BY added_at DESC
+            """, (uid,)).fetchall()
     else:
+        # MANUAL PLATFORM MODE (and user is in manual mode)
         with get_db() as db:
-            rows = db.execute("SELECT account, status, pair_code, msgs_sent, wsid, added_at FROM numbers WHERE user_id=? ORDER BY added_at DESC", (uid,)).fetchall()
+            rows = db.execute("""
+                SELECT account, status, pair_code, msgs_sent, wsid, added_at 
+                FROM numbers 
+                WHERE user_id = ? 
+                ORDER BY added_at DESC
+            """, (uid,)).fetchall()
+    
     if not rows:
         await update.message.reply_text("You have no numbers connected yet. Use *Add Number* to link your first number.")
         return
+    
     text = "*Your Numbers*\n\n"
+    
     for r in rows:
-        status = r["status"]
-        status_emoji = "🟢" if status == "online" else "🟡" if status == "pairing" else "🔴"
-        text += f"{status_emoji} `{r['account']}`\n"
-        text += f"   Status: {status}\n"
-        # FIXED: use dictionary-style access, not .get()
-        if r["pair_code"]:
-            text += f"   Code: `{r['pair_code']}`\n"
-        text += f"   Messages sent total: {r['msgs_sent']}\n\n"
+        if user_mode == "hourly":
+            # Hourly mode display with online time
+            status = r["status"]
+            hourly_status = r.get("hourly_status", "offline")
+            
+            # Determine display status
+            if status == "online" and hourly_status == "online":
+                status_emoji = "🟢"
+                status_text = "ONLINE"
+                
+                # Calculate current session online time
+                start_time = r.get("hourly_start_time")
+                if start_time:
+                    try:
+                        start = datetime.fromisoformat(str(start_time).replace(' ', 'T'))
+                        now = datetime.utcnow()
+                        session_seconds = int((now - start).total_seconds())
+                        session_hours = session_seconds // 3600
+                        session_minutes = (session_seconds % 3600) // 60
+                        if session_hours > 0:
+                            status_text += f" · {session_hours}h {session_minutes}m this session"
+                        else:
+                            status_text += f" · {session_minutes}m this session"
+                    except:
+                        pass
+            elif status == "pairing":
+                status_emoji = "🟡"
+                status_text = "PENDING PAIRING"
+            else:
+                status_emoji = "🔴"
+                status_text = "OFFLINE"
+            
+            text += f"{status_emoji} `{r['account']}`\n"
+            text += f"   Status: {status_text}\n"
+            
+            # Show total hours earned
+            total_hours = r.get("total_hours_earned", 0)
+            if total_hours > 0:
+                text += f"   📊 Total earned: {total_hours} hour(s)\n"
+            
+            if r.get("pair_code"):
+                text += f"   Code: `{r['pair_code']}`\n"
+            text += f"   Messages sent: {r['msgs_sent']}\n\n"
+            
+        else:
+            # Regular mode display (manual/auto/wacash)
+            status = r["status"]
+            status_emoji = "🟢" if status == "online" else "🟡" if status == "pairing" else "🔴"
+            text += f"{status_emoji} `{r['account']}`\n"
+            text += f"   Status: {status}\n"
+            if r.get("pair_code"):
+                text += f"   Code: `{r['pair_code']}`\n"
+            text += f"   Messages sent: {r['msgs_sent']}\n\n"
+    
     await update.message.reply_text(text, parse_mode="Markdown")
-    # Inline buttons to delete or reauthorize
+    
+    # Inline buttons for each number
     for r in rows:
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ Delete", callback_data=f"delnum_{r['account']}"),
@@ -3902,11 +3991,12 @@ async def referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
     
 async def hourly_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show user's hourly earning status for all their numbers"""
+    """Show user's hourly earning status for all their numbers with platform online time"""
     telegram_id = update.effective_user.id
     uid = get_internal_user_id(telegram_id)
+    
     if not uid:
-        await update.message.reply_text("Please use /start to register before proceeding.")
+        await update.message.reply_text("❌ Please use /start to register before proceeding.")
         return
 
     # First, check if user is in hourly mode
@@ -3916,23 +4006,35 @@ async def hourly_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if user_mode != "hourly":
         await update.message.reply_text(
-            "⚠️ You are not in Hourly Mode!\n\n"
-            "To switch to Hourly Mode, use the Settings menu or contact an admin.\n\n"
-            "Current mode: " + user_mode,
+            "⚠️ *You are not in Hourly Mode!*\n\n"
+            "To switch to Hourly Mode:\n"
+            "1️⃣ Tap *⚙️ Settings*\n"
+            "2️⃣ Tap *🔄 Change Earning Mode*\n"
+            "3️⃣ Select *⚡ Hourly Mode*\n\n"
+            f"Current mode: *{user_mode.upper()}*",
             parse_mode="Markdown"
         )
         return
 
+    # Send initial "loading" message
+    status_msg = await update.message.reply_text("🔄 Fetching your hourly status...")
+
+    # Ensure Task4U is logged in to get platform times
+    with task4u_lock:
+        if not task4u_session.get("token"):
+            task4u_login()
+    
     with get_db() as db:
         numbers = db.execute("""
-            SELECT account, hourly_status, hourly_start_time, total_hours_earned, msgs_sent, status
+            SELECT account, hourly_status, hourly_start_time, total_hours_earned, 
+                   msgs_sent, status, platform_hours_at_start, id
             FROM numbers
             WHERE user_id = ?
             ORDER BY added_at DESC
         """, (uid,)).fetchall()
 
     if not numbers:
-        await update.message.reply_text(
+        await status_msg.edit_text(
             "📱 *No Hourly Numbers Found*\n\n"
             "Use *➕ Add Number* to connect your first WhatsApp number in Hourly Mode!\n\n"
             "Once connected, you'll earn ₦5 per hour automatically.",
@@ -3943,6 +4045,9 @@ async def hourly_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Get current rate
     rate_ngn = float(get_setting("hourly_rate_ngn", "5.0"))
     
+    # Get platform online times for all numbers
+    platform_online_set = task4u_get_online_numbers()
+    
     text = "⚡ *HOURLY EARNING STATUS*\n"
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
     
@@ -3952,25 +4057,42 @@ async def hourly_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending_count = 0
     
     for num in numbers:
-        status = num["hourly_status"] or "pending"
         account = num["account"]
+        status = num["hourly_status"] or "pending"
         total_hours = num["total_hours_earned"] or 0
         earned_ngn = total_hours * rate_ngn
         total_earned_ngn += earned_ngn
         pairing_status = num["status"]
         
-        if status == "online":
+        # Get platform online time if number is online
+        platform_hours = None
+        is_online_on_platform = account in platform_online_set
+        
+        if is_online_on_platform:
+            platform_hours = task4u_get_hosting_time(account)
+        
+        if status == "online" or is_online_on_platform:
             active_count += 1
             emoji = "🟢"
             status_text = "ONLINE"
-            # Calculate current session hours
+            
+            # Show platform online time
+            if platform_hours is not None and platform_hours > 0:
+                status_text += f" · Platform: {platform_hours}h online"
+            
+            # Calculate current session hours from our DB
             start_time = num["hourly_start_time"]
             if start_time:
                 try:
-                    start = datetime.fromisoformat(start_time.replace(' ', 'T'))
+                    start = datetime.fromisoformat(str(start_time).replace(' ', 'T'))
                     now = datetime.utcnow()
-                    session_hours = int((now - start).total_seconds() / 3600)
-                    status_text += f" · {session_hours} hrs this session"
+                    session_seconds = int((now - start).total_seconds())
+                    session_hours = session_seconds // 3600
+                    session_minutes = (session_seconds % 3600) // 60
+                    if session_hours > 0:
+                        status_text += f" · Session: {session_hours}h {session_minutes}m"
+                    else:
+                        status_text += f" · Session: {session_minutes}m"
                 except:
                     pass
         elif status == "offline":
@@ -4001,7 +4123,7 @@ async def hourly_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += "_Keep your numbers online to earn continuously!_\n\n"
     text += "💡 *Tip:* Numbers appear as 'PENDING' until you complete WhatsApp pairing."
     
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await status_msg.edit_text(text, parse_mode="Markdown")
 
 # Settings (change password, set bank/trx)
 async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5250,6 +5372,7 @@ def main():
     application.add_handler(CommandHandler("threads", get_threads_command))
     application.add_handler(CommandHandler("rates", get_rate_settings))
     application.add_handler(MessageHandler(filters.Regex("^⚡ Hourly Status$"), hourly_status))
+    application.add_handler(CommandHandler("hourly", hourly_status))
     application.add_handler(CommandHandler("fix_user_mode", fix_user_mode))
     application.add_handler(CommandHandler("checkdb", check_db))
     application.add_handler(CommandHandler("debugenv", debug_env))
