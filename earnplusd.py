@@ -2954,56 +2954,58 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["user_id"] = db_user["id"]
     context.user_data["is_admin"] = db_user["is_admin"]
 
-    # ALWAYS show mode selection on every /start so user can switch anytime
+    # Get the platform's global earning mode
+    platform_mode = get_earning_mode()
+    
+    # Get user's personal earning mode
     user_mode = db_user["earning_mode"] or "manual"
-    manual_tick = "✅" if user_mode == "manual" else ""
-    hourly_tick = "✅" if user_mode == "hourly" else ""
-    is_new = not db_user.get("earning_mode")
+    
+    # Determine if user is using the platform mode or hourly mode
+    user_mode_display = user_mode.upper()
+    platform_mode_display = platform_mode.upper()
+    
+    # Create mode icons
+    platform_icon = "🔧" if platform_mode == "manual" else "🤖" if platform_mode == "auto" else "📲"
+    user_icon = "💰" if user_mode == "manual" else "⚡"
+    
+    # Show mode selection on every /start
+    # First option: Platform mode (Manual/Auto/Wacash based on admin setting)
+    if platform_mode == "manual":
+        platform_button_text = f"🔧 Manual Mode — Tap Send All to earn points"
+    elif platform_mode == "auto":
+        platform_button_text = f"🤖 Auto Mode — Automatic earning"
+    else:  # wacash
+        platform_button_text = f"📲 Wacash Mode — WorkGo1 earning"
+    
+    # Second option: Hourly Mode
+    hourly_button_text = f"⚡ Hourly Mode — Auto-earn ₦5/hour"
+    
+    # Add checkmarks for current user mode
+    platform_tick = " ✅" if user_mode == "manual" else ""
+    hourly_tick = " ✅" if user_mode == "hourly" else ""
+    
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"💰 Manual Mode {manual_tick}", callback_data="set_mode_manual")],
-        [InlineKeyboardButton(f"⚡ Hourly Mode — Auto-earn ₦5/hour {hourly_tick}", callback_data="set_mode_hourly")]
+        [InlineKeyboardButton(f"{platform_button_text}{platform_tick}", callback_data="set_mode_manual")],
+        [InlineKeyboardButton(f"{hourly_button_text}{hourly_tick}", callback_data="set_mode_hourly")]
     ])
+    
+    is_new = not db_user.get("earning_mode")
     if is_new:
         greeting = "🌟 *Welcome to EarnPlus!*"
     else:
         greeting = f"👋 *Welcome back, {user.first_name}!*"
+    
     await update.message.reply_text(
         f"{greeting}\n\n"
-        f"📌 Current mode: *{user_mode.upper()}*\n\n"
-        f"💰 *Manual Mode* — Press Send All to earn points per message\n"
+        f"📌 Current mode: *{user_mode_display}*\n"
+        f"🔧 Platform mode: *{platform_mode_display}*\n\n"
+        f"💰 *{platform_button_text}*\n"
         f"⚡ *Hourly Mode* — Earn ₦5/hour automatically while your number stays online\n\n"
         f"Select your earning mode below:",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
     return
-
-    # (unreachable — kept for structure)
-    if db_user["is_admin"]:
-        # Admin keyboard with Admin Panel button
-        admin_keyboard = ReplyKeyboardMarkup([
-            ["💰 Dashboard", "➕ Add Number", "📞 My Numbers"],
-            ["⚡ Hourly Status", "✉️ Send All", "🏆 Leaderboard"],
-            ["💸 Withdraw", "🔗 Referral", "⚙️ Settings"],
-            ["👑 Admin Panel"]
-        ], resize_keyboard=True)
-        await update.message.reply_text(
-            f"👋 Welcome back, *{user.first_name}*!\n\n"
-            f"📌 Your personal earning mode: *{user_mode.upper()}*\n"
-            f"🔧 Platform mode: *{get_earning_mode().upper()}*\n\n"
-            f"Use the buttons below to navigate.",
-            reply_markup=admin_keyboard,
-            parse_mode="Markdown"
-        )
-    else:
-        # Normal user keyboard
-        await update.message.reply_text(
-            f"👋 Welcome back, *{user.first_name}*!\n\n"
-            f"📌 Your earning mode: *{user_mode.upper()}*\n\n"
-            f"Use the buttons below to navigate.",
-            reply_markup=main_keyboard,
-            parse_mode="Markdown"
-        )
 
 async def mode_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -3031,6 +3033,8 @@ async def set_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle user's earning mode selection from /start or settings"""
     query = update.callback_query
     await query.answer()
+    
+    # "manual" or "hourly" - manual here means use the platform's mode
     mode = query.data.split("_")[-1]   # "manual" or "hourly"
     telegram_id = update.effective_user.id
     
@@ -3047,7 +3051,13 @@ async def set_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["user_id"] = user["id"]
             context.user_data["is_admin"] = user["is_admin"]
     
+    # Get platform mode for display
+    platform_mode = get_earning_mode()
+    
     # Show confirmation with appropriate keyboard
+    mode_display = f"{platform_mode.upper()} (Platform Mode)" if mode == "manual" else "HOURLY"
+    mode_description = "You will now use the platform's earning method." if mode == "manual" else "You will now earn ₦5 per hour automatically."
+    
     if context.user_data.get("is_admin"):
         admin_keyboard = ReplyKeyboardMarkup([
             ["💰 Dashboard", "➕ Add Number", "📞 My Numbers"],
@@ -3056,14 +3066,16 @@ async def set_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ["👑 Admin Panel"]
         ], resize_keyboard=True)
         await query.edit_message_text(
-            f"✅ Mode set to **{mode.upper()}**!\n\n"
+            f"✅ Mode set to **{mode_display}**!\n\n"
+            f"{mode_description}\n\n"
             f"💡 You can now use the main menu.",
             parse_mode="Markdown"
         )
         await query.message.reply_text("Main menu:", reply_markup=admin_keyboard)
     else:
         await query.edit_message_text(
-            f"✅ Mode set to **{mode.upper()}**!\n\n"
+            f"✅ Mode set to **{mode_display}**!\n\n"
+            f"{mode_description}\n\n"
             f"💡 Use the buttons below to start earning.",
             parse_mode="Markdown"
         )
@@ -4178,16 +4190,42 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     
     if data == "sett_change_mode":
+        # Get the platform's global earning mode
+        platform_mode = get_earning_mode()
+        
+        # Get user's current mode
+        telegram_id = update.effective_user.id
+        uid = get_internal_user_id(telegram_id)
+        with get_db() as db:
+            current_user_mode = db.execute("SELECT earning_mode FROM users WHERE id=?", (uid,)).fetchone()
+            current_mode = current_user_mode["earning_mode"] if current_user_mode else "manual"
+        
+        # Create platform mode button text based on admin setting
+        if platform_mode == "manual":
+            platform_button_text = "🔧 Manual Mode — Press 'Send All' to earn points"
+            platform_description = "You press 'Send All' to earn points"
+        elif platform_mode == "auto":
+            platform_button_text = "🤖 Auto Mode — Automatic earning"
+            platform_description = "Numbers are paired and earn automatically"
+        else:  # wacash
+            platform_button_text = "📲 Wacash Mode — WorkGo1 earning"
+            platform_description = "Use WorkGo1 platform for higher earnings"
+        
+        # Add checkmarks
+        platform_tick = " ✅" if current_mode == "manual" else ""
+        hourly_tick = " ✅" if current_mode == "hourly" else ""
+        
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💰 Manual Mode", callback_data="set_mode_manual")],
-            [InlineKeyboardButton("⚡ Hourly Mode", callback_data="set_mode_hourly")],
+            [InlineKeyboardButton(f"{platform_button_text}{platform_tick}", callback_data="set_mode_manual")],
+            [InlineKeyboardButton(f"⚡ Hourly Mode — Auto-earn ₦5/hour{hourly_tick}", callback_data="set_mode_hourly")],
             [InlineKeyboardButton("🔙 Back to Settings", callback_data="sett_back")]
         ])
+        
         await query.edit_message_text(
             "🔄 *Change Your Earning Mode*\n\n"
             "Choose your preferred earning method:\n\n"
-            "💰 *Manual Mode* – You press 'Send All' to earn points\n"
-            "⚡ *Hourly Mode* – Earn ₦5 per hour automatically\n\n"
+            f"📌 *Platform Mode ({platform_mode.upper()})* – {platform_description}\n"
+            f"⚡ *Hourly Mode* – Earn ₦5 per hour automatically\n\n"
             "⚠️ Note: Changing mode will affect new numbers you add.\n"
             "Existing numbers will keep their current mode.",
             reply_markup=keyboard,
