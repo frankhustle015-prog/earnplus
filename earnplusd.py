@@ -4719,72 +4719,83 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     elif data.startswith("earn_"):
-        log.info(f"🔁 Mode switch callback received: {data}")
-        new_mode = data.split("_")[1]
-        log.info(f"🔁 Switching to mode: {new_mode}")
-        
-        # If switching to wacash, verify credentials exist
-        if new_mode == "wacash":
-            acct = get_setting("wacash_account", "")
-            pwd = get_setting("wacash_password", "")
-            log.info(f"Wacash credentials - Account: {'SET' if acct else 'NOT SET'}, Password: {'SET' if pwd else 'NOT SET'}")
-            if not acct or not pwd:
-                await query.edit_message_text(
-                    "⚠️ Cannot switch to Wacash mode: No WorkGo1 credentials set.\n"
-                    "Please set them using '🔑 Set Wacash Credentials' first.",
-                    reply_markup=admin_panel_markup
-                )
-                return
-        
-        # Direct database update to ensure it works
-        with get_db() as db:
-            db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('earning_mode', ?)", (new_mode,))
-        
-        # Also update via set_setting for cache
-        set_setting("earning_mode", new_mode)
-        
-        # Verify the update worked
-        with get_db() as db:
-            verify = db.execute("SELECT value FROM settings WHERE key='earning_mode'").fetchone()
-            log.info(f"Verified mode in DB: {verify['value'] if verify else 'NOT FOUND'}")
-        
-        # Post-switch side effects
-        if new_mode == "wacash":
-            threading.Thread(target=wacash_login, daemon=True).start()
-        elif new_mode == "auto" and _worker_client is None:
-            asyncio.create_task(_start_task_worker())
-
-        # Verify the switch actually took effect by reading back from DB
-        confirmed = get_earning_mode()
-        mode_notes = {
-            "manual": "Users must tap Send All to fire messages manually.",
-            "auto":   "Telethon worker will auto-pair and send for each user.",
-            "wacash": "WorkGo1 (TaskGo) handles pairing and message sending.",
-        }
-        mode_icons = {"manual": "\U0001f590", "auto": "\U0001f916", "wacash": "\U0001f4f2"}
-
-        if confirmed == new_mode:
-            feedback = (
-                f"{mode_icons.get(new_mode, '⚙️')} *Mode switched to {new_mode.upper()}*\n\n"
-                f"✅ Change confirmed in database.\n"
-                f"📝 {mode_notes.get(new_mode, '')}"
+    log.info(f"🔁 Mode switch callback received: {data}")
+    new_mode = data.split("_")[1]
+    log.info(f"🔁 Switching to mode: {new_mode}")
+    
+    # If switching to wacash, verify credentials exist
+    if new_mode == "wacash":
+        acct = get_setting("wacash_account", "")
+        pwd = get_setting("wacash_password", "")
+        log.info(f"Wacash credentials - Account: {'SET' if acct else 'NOT SET'}, Password: {'SET' if pwd else 'NOT SET'}")
+        if not acct or not pwd:
+            await query.edit_message_text(
+                "⚠️ Cannot switch to Wacash mode: No WorkGo1 credentials set.\n"
+                "Please set them using '🔑 Set Wacash Credentials' first.",
+                reply_markup=admin_panel_markup
+            )
+            return
+    
+    # Direct database update to ensure it works
+    with get_db() as db:
+        if DATABASE_URL:
+            # PostgreSQL syntax with ON CONFLICT
+            db.execute(
+                "INSERT INTO settings(key, value) VALUES(%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                ('earning_mode', new_mode)
             )
         else:
-            feedback = (
-                f"⚠️ *Mode switch may have failed!*\n\n"
-                f"Requested: `{new_mode}`\n"
-                f"Current in DB: `{confirmed}`\n\n"
-                f"Try: `/force_mode {new_mode}`"
-            )
+            # SQLite syntax
+            db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", ('earning_mode', new_mode))
+    
+    # Also update via set_setting for cache
+    set_setting("earning_mode", new_mode)
+    
+    # Verify the update worked
+    with get_db() as db:
+        if DATABASE_URL:
+            verify = db.execute("SELECT value FROM settings WHERE key=%s", ('earning_mode',)).fetchone()
+        else:
+            verify = db.execute("SELECT value FROM settings WHERE key=?", ('earning_mode',)).fetchone()
+        log.info(f"Verified mode in DB: {verify['value'] if verify else 'NOT FOUND'}")
+    
+    # Post-switch side effects
+    if new_mode == "wacash":
+        threading.Thread(target=wacash_login, daemon=True).start()
+    elif new_mode == "auto" and _worker_client is None:
+        asyncio.create_task(_start_task_worker())
 
-        await query.edit_message_text(
-            feedback,
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_back")
-            ]])
+    # Verify the switch actually took effect by reading back from DB
+    confirmed = get_earning_mode()
+    mode_notes = {
+        "manual": "Users must tap Send All to fire messages manually.",
+        "auto":   "Telethon worker will auto-pair and send for each user.",
+        "wacash": "WorkGo1 (TaskGo) handles pairing and message sending.",
+    }
+    mode_icons = {"manual": "\U0001f590", "auto": "\U0001f916", "wacash": "\U0001f4f2"}
+
+    if confirmed == new_mode:
+        feedback = (
+            f"{mode_icons.get(new_mode, '⚙️')} *Mode switched to {new_mode.upper()}*\n\n"
+            f"✅ Change confirmed in database.\n"
+            f"📝 {mode_notes.get(new_mode, '')}"
         )
-        log.info(f"Admin switched earning mode to {new_mode} — confirmed={confirmed}")
+    else:
+        feedback = (
+            f"⚠️ *Mode switch may have failed!*\n\n"
+            f"Requested: `{new_mode}`\n"
+            f"Current in DB: `{confirmed}`\n\n"
+            f"Try: `/force_mode {new_mode}`"
+        )
+
+    await query.edit_message_text(
+        feedback,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_back")
+        ]])
+    )
+    log.info(f"Admin switched earning mode to {new_mode} — confirmed={confirmed}")
 
     elif data == "admin_gen_code":
         await query.edit_message_text("Send command: `/gen_code <points> [count]`\nExample: `/gen_code 500 5`")
