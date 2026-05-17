@@ -274,15 +274,15 @@ def init_db():
         is_postgres = DATABASE_URL is not None
         
         if is_postgres:
-            # PostgreSQL syntax
+            # PostgreSQL syntax with BIGINT for Telegram IDs
             db.execute("""
                 CREATE TABLE IF NOT EXISTS users(
                     id SERIAL PRIMARY KEY,
-                    telegram_id INTEGER UNIQUE,
+                    telegram_id BIGINT UNIQUE,
                     username TEXT,
                     password TEXT,
                     is_admin INTEGER DEFAULT 0,
-                    balance REAL DEFAULT 0,
+                    balance BIGINT DEFAULT 0,
                     referral_code TEXT UNIQUE,
                     referred_by INTEGER,
                     is_banned INTEGER DEFAULT 0,
@@ -294,7 +294,7 @@ def init_db():
             db.execute("""
                 CREATE TABLE IF NOT EXISTS auth_tokens(
                     token TEXT PRIMARY KEY,
-                    user_id INTEGER NOT NULL,
+                    user_id BIGINT NOT NULL,
                     expires_at TIMESTAMP NOT NULL
                 )
             """)
@@ -386,7 +386,7 @@ def init_db():
                     id SERIAL PRIMARY KEY,
                     user_id INTEGER,
                     type TEXT,
-                    amount REAL,
+                    amount BIGINT,
                     description TEXT,
                     created_at TIMESTAMP DEFAULT NOW()
                 )
@@ -441,7 +441,7 @@ def init_db():
             db.execute("""
                 CREATE TABLE IF NOT EXISTS admin_logs(
                     id SERIAL PRIMARY KEY,
-                    admin_id INTEGER NOT NULL,
+                    admin_id BIGINT NOT NULL,
                     action TEXT NOT NULL,
                     target TEXT,
                     detail TEXT,
@@ -670,7 +670,7 @@ def init_db():
                     "INSERT INTO users(telegram_id,username,password,is_admin,referral_code) VALUES(?,?,?,1,?)",
                     (ADMIN_TELEGRAM_ID, "admin", _hash_pw("admin123"), ref)
                 )
-                log.info("Admin user created (telegram_id=%s)", ADMIN_TELEGRAM_ID)
+                log.info("Admin user created (telegram_id=%s)", ADMIN_TELEGRAM_ID))
 
 # ----------------------------------------------------------------------
 # Platform API functions (unchanged from original)
