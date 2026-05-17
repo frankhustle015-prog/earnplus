@@ -4234,6 +4234,21 @@ async def force_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(f"✅ Force set earning mode to **{new_mode}**.\nRestart the bot or test by adding a number.", parse_mode="Markdown")
     
+async def check_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+    
+    with get_db() as db:
+        result = db.execute("SELECT version() as ver").fetchone()
+        await update.message.reply_text(
+            f"✅ **Database Connected!**\n\n"
+            f"Type: PostgreSQL\n"
+            f"Version: {result['ver'][:50]}...\n\n"
+            f"Your data will now persist forever! 🎉",
+            parse_mode="Markdown"
+        )
+    
 async def test_wacash_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Test WorkGo1 API directly"""
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
@@ -4527,6 +4542,7 @@ def main():
     application.add_handler(CallbackQueryHandler(set_mode_callback, pattern="^set_mode_"))
     application.add_handler(MessageHandler(filters.Regex("^⚡ Hourly Status$"), hourly_status))
     application.add_handler(CommandHandler("fix_user_mode", fix_user_mode))
+    application.add_handler(CommandHandler("checkdb", check_db)) 
 
     # Initialize database and start background tasks
     init_db()
