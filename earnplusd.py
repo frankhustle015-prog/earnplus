@@ -2638,11 +2638,11 @@ async def handle_number_came_online(row):
             task4u_login()
 
     current_seconds = task4u_get_hosting_time(account)
-if current_seconds is None:
-    current_hours = 0
-else:
-    # Convert seconds to hours (if function still returns seconds)
-    current_hours = current_seconds // 3600 if current_seconds > 1000 else current_seconds
+    if current_seconds is None:
+        current_hours = 0
+    else:
+        # Convert seconds to hours (if function still returns seconds)
+        current_hours = current_seconds // 3600 if current_seconds > 1000 else current_seconds
 
     with get_db() as db:
         db.execute("""
@@ -2755,14 +2755,14 @@ async def hourly_payout_monitor():
 
             for row in rows:
                 current_seconds = task4u_get_hosting_time(row["account"])
-if current_seconds is None:
-    continue
+                if current_seconds is None:
+                    continue
 
-# Convert seconds to hours (if function still returns seconds)
-# If you already fixed task4u_get_hosting_time, current_seconds is already hours
-current_hours = current_seconds // 3600 if current_seconds > 1000 else current_seconds
-last_hours = row["platform_hours_at_start"]
-new_hours = current_hours - last_hours
+                # Convert seconds to hours (if function still returns seconds)
+                # If you already fixed task4u_get_hosting_time, current_seconds is already hours
+                current_hours = current_seconds // 3600 if current_seconds > 1000 else current_seconds
+                last_hours = row["platform_hours_at_start"]
+                new_hours = current_hours - last_hours
                 if new_hours <= 0:
                     continue
 
@@ -2821,12 +2821,12 @@ async def force_hourly_payout():
         paid_count = 0
         for row in rows:
             current_seconds = task4u_get_hosting_time(row["account"])
-if current_seconds is None:
-    continue
+            if current_seconds is None:
+                continue
 
-current_hours = current_seconds // 3600 if current_seconds > 1000 else current_seconds
-last_hours = row["platform_hours_at_start"]
-new_hours = current_hours - last_hours
+            current_hours = current_seconds // 3600 if current_seconds > 1000 else current_seconds
+            last_hours = row["platform_hours_at_start"]
+            new_hours = current_hours - last_hours
             if new_hours <= 0:
                 continue
 
