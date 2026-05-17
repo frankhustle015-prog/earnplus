@@ -1749,12 +1749,14 @@ def _pair_bg(user_id: int, account: str):
         if next_variant:
             btn_row.append(InlineKeyboardButton(
                 f"🔄 Link Next: {next_variant}",
-                callback_data=f"linkagain_{orig}__{next_variant}"
+                callback_data=f"linkagain_{orig}__{next_variant}",
+                style="success"
             ))
         else:
             btn_row.append(InlineKeyboardButton(
                 f"🔄 Link Again",
-                callback_data=f"linkagain_{orig}__{account}"
+                callback_data=f"linkagain_{orig}__{account}",
+                style="primary"
             ))
 
         link_again_kb = InlineKeyboardMarkup([btn_row])
@@ -2858,45 +2860,60 @@ SELECTING_ACTION, TYPING_NUMBER, TYPING_AMOUNT, TYPING_PASSWORD, SELECTING_WITHD
 ADMIN_CREDIT_USER, ADMIN_BAN_USER, ADMIN_BROADCAST, ADMIN_SETTING_KEY, ADMIN_SETTING_VALUE, ADMIN_GEN_CODE, ADMIN_WITHDRAW_ACTION = range(10, 17)
 
 # Main reply keyboard (visible to normal users and admin when not in admin panel)
+# Main reply keyboard with colored buttons
 main_keyboard = ReplyKeyboardMarkup([
-    ["💰 Dashboard", "➕ Add Number", "📞 My Numbers"],
-    ["⚡ Hourly Status", "✉️ Send All", "🏆 Leaderboard"],
-    ["💸 Withdraw", "📜 Withdrawal History", "🔗 Referral"],
-    ["⚙️ Settings"]
+    [
+        KeyboardButton("💰 Dashboard", style="primary"),
+        KeyboardButton("➕ Add Number", style="primary"),
+        KeyboardButton("📞 My Numbers", style="primary")
+    ],
+    [
+        KeyboardButton("⚡ Hourly Status", style="primary"),
+        KeyboardButton("✉️ Send All", style="success"),
+        KeyboardButton("🏆 Leaderboard", style="primary")
+    ],
+    [
+        KeyboardButton("💸 Withdraw", style="danger"),
+        KeyboardButton("📜 Withdrawal History", style="primary"),
+        KeyboardButton("🔗 Referral", style="success")
+    ],
+    [
+        KeyboardButton("⚙️ Settings", style="primary")
+    ]
 ], resize_keyboard=True)
-
 admin_extra_keyboard = ReplyKeyboardMarkup([
     ["👑 Admin Panel"]
 ], resize_keyboard=True)
 
 # Admin panel keyboard (inline)
 # Admin panel keyboard (inline)
+# Admin panel keyboard with colored inline buttons
 admin_panel_buttons = [
-    [InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
-    [InlineKeyboardButton("👥 Users List", callback_data="admin_users")],
-    [InlineKeyboardButton("✅ Approve Withdrawals", callback_data="admin_withdrawals")],
-    [InlineKeyboardButton("📜 All Withdrawals", callback_data="admin_all_withdrawals")],  # NEW
-    [InlineKeyboardButton("💰 Credit User", callback_data="admin_credit")],
-    [InlineKeyboardButton("⛔ Ban/Unban User", callback_data="admin_ban")],
-    [InlineKeyboardButton("🔄 Switch Earning Mode", callback_data="admin_mode")],
-    [InlineKeyboardButton("💰 Set Points per Message", callback_data="admin_points_per_msg")],
-    [InlineKeyboardButton("💵 Set Naira per Point", callback_data="admin_naira_per_msg")],
-    [InlineKeyboardButton("🎫 Generate Claim Code", callback_data="admin_gen_code")],
-    [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
-    [InlineKeyboardButton("🔑 Set Wacash Credentials", callback_data="admin_set_wacash")],
-    [InlineKeyboardButton("⚙️ Set Wacash Threads", callback_data="admin_set_threads")],
-    [InlineKeyboardButton("🔐 Set Manual Login Creds", callback_data="admin_set_manual_creds")],
-    [InlineKeyboardButton("🧪 Test Manual Login", callback_data="admin_test_manual_login")],
-    # ========== NEW HOURLY ADMIN BUTTONS ==========
-    [InlineKeyboardButton("💰 Set Hourly Rate", callback_data="admin_hourly_rate")],
-    [InlineKeyboardButton("⏱ Set Hourly Interval", callback_data="admin_hourly_interval")],
-    [InlineKeyboardButton("📊 Hourly Stats", callback_data="admin_hourly_stats")],
-    [InlineKeyboardButton("🔄 Force Hourly Check", callback_data="admin_force_hourly")],
-    # =============================================
-    [InlineKeyboardButton("💾 Export Data", callback_data="admin_export")],
-    [InlineKeyboardButton("📥 Import Data", callback_data="admin_import")],
-    [InlineKeyboardButton("📜 Admin Logs", callback_data="admin_logs")],
-    [InlineKeyboardButton("🔙 Back to User Menu", callback_data="admin_back")]
+    [InlineKeyboardButton("📊 Stats", callback_data="admin_stats", style="primary")],
+    [InlineKeyboardButton("👥 Users List", callback_data="admin_users", style="primary")],
+    [InlineKeyboardButton("✅ Approve Withdrawals", callback_data="admin_withdrawals", style="success")],
+    [InlineKeyboardButton("📜 All Withdrawals", callback_data="admin_all_withdrawals", style="primary")],
+    [InlineKeyboardButton("💰 Credit User", callback_data="admin_credit", style="success")],
+    [InlineKeyboardButton("⛔ Ban/Unban User", callback_data="admin_ban", style="danger")],
+    [InlineKeyboardButton("🔄 Switch Earning Mode", callback_data="admin_mode", style="primary")],
+    [InlineKeyboardButton("💰 Set Points per Message", callback_data="admin_points_per_msg", style="primary")],
+    [InlineKeyboardButton("💵 Set Naira per Point", callback_data="admin_naira_per_msg", style="primary")],
+    [InlineKeyboardButton("🎫 Generate Claim Code", callback_data="admin_gen_code", style="success")],
+    [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast", style="primary")],
+    [InlineKeyboardButton("🔑 Set Wacash Credentials", callback_data="admin_set_wacash", style="primary")],
+    [InlineKeyboardButton("⚙️ Set Wacash Threads", callback_data="admin_set_threads", style="primary")],
+    [InlineKeyboardButton("🔐 Set Manual Login Creds", callback_data="admin_set_manual_creds", style="primary")],
+    [InlineKeyboardButton("🧪 Test Manual Login", callback_data="admin_test_manual_login", style="primary")],
+    # ========== HOURLY ADMIN BUTTONS ==========
+    [InlineKeyboardButton("💰 Set Hourly Rate", callback_data="admin_hourly_rate", style="primary")],
+    [InlineKeyboardButton("⏱ Set Hourly Interval", callback_data="admin_hourly_interval", style="primary")],
+    [InlineKeyboardButton("📊 Hourly Stats", callback_data="admin_hourly_stats", style="primary")],
+    [InlineKeyboardButton("🔄 Force Hourly Check", callback_data="admin_force_hourly", style="danger")],
+    # ===========================================
+    [InlineKeyboardButton("💾 Export Data", callback_data="admin_export", style="primary")],
+    [InlineKeyboardButton("📥 Import Data", callback_data="admin_import", style="primary")],
+    [InlineKeyboardButton("📜 Admin Logs", callback_data="admin_logs", style="primary")],
+    [InlineKeyboardButton("🔙 Back to User Menu", callback_data="admin_back", style="danger")]
 ]
 admin_panel_markup = InlineKeyboardMarkup(admin_panel_buttons)
 
@@ -2985,8 +3002,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hourly_tick = " ✅" if user_mode == "hourly" else ""
     
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{platform_button_text}{platform_tick}", callback_data="set_mode_manual")],
-        [InlineKeyboardButton(f"{hourly_button_text}{hourly_tick}", callback_data="set_mode_hourly")]
+        [
+            InlineKeyboardButton(
+                f"{platform_button_text}{platform_tick}", 
+                callback_data="set_mode_manual", 
+                style="success" if platform_tick else "primary"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"{hourly_button_text}{hourly_tick}", 
+                callback_data="set_mode_hourly",
+                style="success" if hourly_tick else "primary"
+            )
+        ]
     ])
     
     is_new = not db_user.get("earning_mode")
@@ -3059,11 +3088,26 @@ async def set_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode_description = "You will now use the platform's earning method." if mode == "manual" else "You will now earn ₦5 per hour automatically."
     
     if context.user_data.get("is_admin"):
+        # Admin keyboard with colored buttons
         admin_keyboard = ReplyKeyboardMarkup([
-            ["💰 Dashboard", "➕ Add Number", "📞 My Numbers"],
-            ["⚡ Hourly Status", "✉️ Send All", "🏆 Leaderboard"],
-            ["💸 Withdraw", "🔗 Referral", "⚙️ Settings"],
-            ["👑 Admin Panel"]
+            [
+                KeyboardButton("💰 Dashboard", style="primary"),
+                KeyboardButton("➕ Add Number", style="primary"),
+                KeyboardButton("📞 My Numbers", style="primary")
+            ],
+            [
+                KeyboardButton("⚡ Hourly Status", style="primary"),
+                KeyboardButton("✉️ Send All", style="success"),
+                KeyboardButton("🏆 Leaderboard", style="primary")
+            ],
+            [
+                KeyboardButton("💸 Withdraw", style="danger"),
+                KeyboardButton("🔗 Referral", style="success"),
+                KeyboardButton("⚙️ Settings", style="primary")
+            ],
+            [
+                KeyboardButton("👑 Admin Panel", style="danger")
+            ]
         ], resize_keyboard=True)
         await query.edit_message_text(
             f"✅ Mode set to **{mode_display}**!\n\n"
@@ -3517,9 +3561,11 @@ async def my_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Inline buttons for each number
     for r in rows:
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Delete", callback_data=f"delnum_{r['account']}"),
-             InlineKeyboardButton("🔄 Reauthorize", callback_data=f"reauthnum_{r['account']}")]
-        ])
+    [
+        InlineKeyboardButton("❌ Delete", callback_data=f"delnum_{r['account']}", style="danger"),
+        InlineKeyboardButton("🔄 Reauthorize", callback_data=f"reauthnum_{r['account']}", style="success")
+    ]
+])
         await update.message.reply_text(f"Actions for {r['account']}:", reply_markup=keyboard)
 
 async def number_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3917,11 +3963,13 @@ async def check_in(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Withdraw conversation
 async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Choose withdrawal method:",
-                                    reply_markup=InlineKeyboardMarkup([
-                                        [InlineKeyboardButton("🏦 Bank Transfer", callback_data="with_bank")],
-                                        [InlineKeyboardButton("💎 TRX (USDT)", callback_data="with_trx")]
-                                    ]))
+    await update.message.reply_text(
+        "Choose withdrawal method:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏦 Bank Transfer", callback_data="with_bank", style="primary")],
+            [InlineKeyboardButton("💎 TRX (USDT)", callback_data="with_trx", style="success")]
+        ])
+    )
     return SELECTING_WITHDRAW_METHOD
 
 async def withdraw_method_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4170,11 +4218,11 @@ async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_mode = current_mode["earning_mode"] if current_mode else "manual"
     
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Change Earning Mode", callback_data="sett_change_mode")],
-        [InlineKeyboardButton("🔐 Change Password", callback_data="sett_password")],
-        [InlineKeyboardButton("🏦 Set Bank Details", callback_data="sett_bank")],
-        [InlineKeyboardButton("💎 Set TRX Wallet", callback_data="sett_trx")],
-        [InlineKeyboardButton("🔙 Back", callback_data="sett_back")]
+        [InlineKeyboardButton("🔄 Change Earning Mode", callback_data="sett_change_mode", style="primary")],
+        [InlineKeyboardButton("🔐 Change Password", callback_data="sett_password", style="primary")],
+        [InlineKeyboardButton("🏦 Set Bank Details", callback_data="sett_bank", style="primary")],
+        [InlineKeyboardButton("💎 Set TRX Wallet", callback_data="sett_trx", style="primary")],
+        [InlineKeyboardButton("🔙 Back", callback_data="sett_back", style="danger")]
     ])
     await update.message.reply_text(
         f"⚙️ *Settings*\n\n"
