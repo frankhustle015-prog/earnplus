@@ -134,19 +134,44 @@ def get_db():
         from psycopg2.extras import RealDictCursor
         
         conn = None
-        cur = None
         try:
             conn = psycopg2.connect(DATABASE_URL)
+            # Create a cursor that works like sqlite3
             cur = conn.cursor(cursor_factory=RealDictCursor)
-            yield cur  # Return cursor instead of connection
+            
+            # Create a wrapper that makes execute return the cursor
+            class CursorWrapper:
+                def __init__(self, cursor, connection):
+                    self.cursor = cursor
+                    self.connection = connection
+                
+                def execute(self, sql, params=None):
+                    if params:
+                        self.cursor.execute(sql, params)
+                    else:
+                        self.cursor.execute(sql)
+                    return self
+                
+                def fetchone(self):
+                    return self.cursor.fetchone()
+                
+                def fetchall(self):
+                    return self.cursor.fetchall()
+                
+                def __enter__(self):
+                    return self
+                
+                def __exit__(self, *args):
+                    pass
+            
+            wrapper = CursorWrapper(cur, conn)
+            yield wrapper
             conn.commit()
         except Exception:
             if conn:
                 conn.rollback()
             raise
         finally:
-            if cur:
-                cur.close()
             if conn:
                 conn.close()
     else:
@@ -4251,18 +4276,17 @@ async def check_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         with get_db() as db:
-            # Check which database we're using
             is_postgres = DATABASE_URL is not None
             
             if is_postgres:
                 db.execute("SELECT version() as ver")
                 result = db.fetchone()
-                version = result['ver'][:50]
+                version = result['ver'][:50] if result else "Unknown"
                 db_type = "PostgreSQL ✅"
             else:
                 db.execute("SELECT sqlite_version() as ver")
                 result = db.fetchone()
-                version = result['ver']
+                version = result['ver'] if result else "Unknown"
                 db_type = "SQLite (⚠️ Data will NOT persist!)"
             
             # Count users
