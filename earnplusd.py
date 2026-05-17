@@ -5109,6 +5109,28 @@ async def update_spinner_message(msg, new_text: str):
     except Exception:
         pass
 
+
+# ============ SESSION KEEPALIVE (Required for platform session) ============
+def _session_keepalive():
+    """Keep platform session alive (same as original)."""
+    while True:
+        time.sleep(600)
+        try:
+            s = dict(platform_session)
+            if not s.get("http"):
+                platform_login()
+                continue
+            sign = _s0("/api/user/get_appinfo", str(s["userid"]), s["username"])
+            r = s["http"].get(f"{BASE_URL}/api/user/get_appinfo",
+                params={"page": 1, "pagesize": 1, "username": s["username"],
+                        "userid": s["userid"], "sign": sign},
+                headers=_hdrs(), timeout=10)
+            if r.json().get("code") != 0:
+                platform_login()
+        except Exception:
+            platform_login()
+
+
 # ----------------------------------------------------------------------
 # Main bot setup
 # ----------------------------------------------------------------------
@@ -5166,6 +5188,7 @@ async def post_init(app):
     log.info("[Speed] Session keepalive thread started")
     
     log.info("[Bot] post_init: ALL WORKERS STARTED - Bot is ready!")
+
 
 def main():
     global _application, _bot_loop
@@ -5247,6 +5270,7 @@ def main():
 
     # Start the bot
     application.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
