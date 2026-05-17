@@ -126,60 +126,11 @@ _wacash_fire_lock = threading.Lock()
 # ----------------------------------------------------------------------
 # Database helpers (same as original)
 # ----------------------------------------------------------------------
-class _PGConn:
-    """
-    Thin wrapper around psycopg2 connection that:
-    1. Uses RealDictCursor so rows support row["column"] access
-    2. Converts ? placeholders to %s (SQLite → PostgreSQL)
-    """
-    def __init__(self, conn):
-        self._conn = conn
-
-    def execute(self, sql, params=None):
-        sql = sql.replace("?", "%s")
-        cur = self._conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute(sql, params or ())
-        return cur
-
-    def executescript(self, script):
-        """Run a SQLite script in PostgreSQL — translate incompatible syntax."""
-        for stmt in script.split(";"):
-            stmt = stmt.strip()
-            if not stmt:
-                continue
-            # Translate SQLite → PostgreSQL syntax
-            stmt = stmt.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
-            stmt = stmt.replace("INSERT OR IGNORE INTO", "INSERT INTO")
-            stmt = stmt.replace("INSERT OR REPLACE INTO", "INSERT INTO")
-            # Append ON CONFLICT DO NOTHING for INSERT OR IGNORE
-            if "INSERT INTO" in stmt and "ON CONFLICT" not in stmt:
-                stmt = stmt + " ON CONFLICT DO NOTHING"
-            # datetime('now') → NOW()
-            stmt = stmt.replace("datetime('now')", "NOW()")
-            stmt = stmt.replace("DEFAULT(datetime('now'))", "DEFAULT NOW()")
-            cur = self._conn.cursor()
-            try:
-                cur.execute(stmt)
-            except Exception as e:
-                log.warning(f"[PG] executescript stmt error: {e!r} — stmt={stmt[:120]}")
-
-    def executemany(self, sql, params_list):
-        sql = sql.replace("?", "%s")
-        cur = self._conn.cursor()
-        cur.executemany(sql, params_list)
-        return cur
-
-    def commit(self):   self._conn.commit()
-    def rollback(self): self._conn.rollback()
-    def close(self):    self._conn.close()
-
-
 @contextmanager
 def get_db():
     if DATABASE_URL:
-        # PostgreSQL for Railway — wrapped for SQLite-compatible access
-        raw = psycopg2.connect(DATABASE_URL)
-        conn = _PGConn(raw)
+        # PostgreSQL for Railway
+        conn = psycopg2.connect(DATABASE_URL)
         try:
             yield conn
             conn.commit()
@@ -225,15 +176,7 @@ def get_setting(k, d=None):
 
 def set_setting(k, v):
     with get_db() as db:
-        if DATABASE_URL:
-            # PostgreSQL UPSERT
-            db.execute(
-                "INSERT INTO settings(key, value) VALUES(?,?) "
-                "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-                (k, str(v))
-            )
-        else:
-            db.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", (k, str(v)))
+        db.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", (k, str(v)))
 
 def get_earning_mode() -> str:
     return get_setting("earning_mode", "manual")
@@ -995,14 +938,12 @@ def _task4u_headers() -> dict:
 
 
 def _task4u_ps():
-    """Get Task4U session, login if needed. Does NOT hold the lock during login."""
+    """Get Task4U session, login if needed."""
     global task4u_session
     with task4u_lock:
-        has_session = bool(task4u_session.get("token") and task4u_session.get("http"))
-    if not has_session:
-        log.warning("[Task4U] Session lost — re-logging in...")
-        task4u_login()
-    with task4u_lock:
+        if not task4u_session.get("token") or not task4u_session.get("http"):
+            log.warning("[Task4U] Session lost — re-logging in...")
+            task4u_login()
         return dict(task4u_session)
 
 
@@ -2239,11 +2180,10 @@ async def realtime_hourly_monitor():
                 await asyncio.sleep(10)
                 continue
 
-            # Ensure Task4U is logged in (no lock held during login)
+            # Ensure Task4U is logged in
             with task4u_lock:
-                needs_login = not task4u_session.get("token")
-            if needs_login:
-                task4u_login()
+                if not task4u_session.get("token"):
+                    task4u_login()
 
             with get_db() as db:
                 rows = db.execute("""
@@ -2280,11 +2220,10 @@ async def hourly_payout_monitor():
                 await asyncio.sleep(60)
                 continue
 
-            # Ensure Task4U is logged in (no lock held during login)
-            with task4u_lock:
-                needs_login = not task4u_session.get("token")
-            if needs_login:
-                task4u_login()
+            # Ensure Task4U is logged in
+            with task4u_lock:  # Correct
+                if not task4u_session.get("token"):
+                    task4u_login()
 
             with get_db() as db:
                 rows = db.execute("""
@@ -2453,10 +2392,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "INSERT INTO users(telegram_id, username, password, referral_code, is_admin, earning_mode) VALUES(?,?,?,?,?, NULL)",
                 (telegram_id, username, _hash_pw("default"), ref_code, is_admin)
             )
-            if DATABASE_URL:
-                new_id = db.execute("SELECT id FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()["id"]
-            else:
-                new_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+            new_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
             await send_telegram(telegram_id, f"Welcome {username}! Your account has been created.\n"
                                              f"Referral code: `{ref_code}`\n"
                                              f"Share it to earn bonuses.", parse_mode="Markdown")
@@ -2470,31 +2406,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["user_id"] = db_user["id"]
     context.user_data["is_admin"] = db_user["is_admin"]
 
-    # ALWAYS show mode selection on /start so user can switch modes anytime
-    user_mode = db_user["earning_mode"] or "manual"
-    current_mode_label = "⚡ Hourly" if user_mode == "hourly" else "💰 Manual"
-    manual_tick = "✅" if user_mode == "manual" else ""
-    hourly_tick = "✅" if user_mode == "hourly" else ""
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"💰 Manual Mode {manual_tick}", callback_data="set_mode_manual")],
-        [InlineKeyboardButton(f"⚡ Hourly Mode — Auto-earn ₦5/hour {hourly_tick}", callback_data="set_mode_hourly")]
-    ])
-    is_new = not db_user.get("earning_mode")
-    if is_new:
-        greeting = "🌟 *Welcome to EarnPlus!*"
-    else:
-        greeting = f"👋 *Welcome back, {user.first_name}!*"
-    await update.message.reply_text(
-        f"{greeting}\n\n"
-        f"📌 Current mode: *{current_mode_label}*\n\n"
-        f"💰 *Manual Mode* — Press Send All to earn points per message\n"
-        f"⚡ *Hourly Mode* — Earn ₦5/hour automatically while your number stays online\n\n"
-        f"Select your earning mode below:",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
-    return
-
+    # ALWAYS show mode selection if user hasn't chosen a personal earning mode yet
+    if not db_user["earning_mode"] or db_user["earning_mode"] == "" or db_user["earning_mode"] is None:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💰 Manual Mode (Press Send All)", callback_data="set_mode_manual")],
+            [InlineKeyboardButton("⚡ Hourly Mode (Auto-earn ₦5/hour)", callback_data="set_mode_hourly")]
+        ])
+        await update.message.reply_text(
+            "🌟 *Welcome to EarnPlus Bot!* 🌟\n\n"
+            "Please choose your preferred **earning mode**:\n\n"
+            "💰 *Manual Mode* – You press 'Send All' to earn points\n"
+            "⚡ *Hourly Mode* – Earn ₦5 per hour automatically while your number stays online\n\n"
+            "💡 *Tip:* You can change this later in Settings → Personal Mode\n"
+            "⚙️ *Admin Note:* Platform mode (Manual/Auto/Wacash) is separate from your personal earning mode.",
+            reply_markup=keyboard, 
+            parse_mode="Markdown"
+        )
+        return
+    
+    # User already has a personal mode set - show appropriate menu
+    user_mode = db_user["earning_mode"]
     
     if db_user["is_admin"]:
         # Admin keyboard with Admin Panel button
