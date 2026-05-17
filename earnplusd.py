@@ -4463,7 +4463,13 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         text = "⏳ *Pending Withdrawals*\n\n"
         for w in wds:
-            text += f"ID: `{w['id']}` | {w['username']} | ₦{w['amount']:.2f} | {w['method']} | {w['created_at'][:10]}\n"
+            # Handle datetime object correctly
+            created_at = w["created_at"]
+            if hasattr(created_at, 'strftime'):
+                created_str = created_at.strftime("%Y-%m-%d")
+            else:
+                created_str = str(created_at)[:10] if created_at else "Unknown"
+            text += f"ID: `{w['id']}` | {w['username']} | ₦{w['amount']:.2f} | {w['method']} | {created_str}\n"
         text += "\nTo approve/reject, use:\n/admin_withdraw <id> approve|reject [reason]"
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_panel_markup)
         
@@ -4505,7 +4511,13 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             pts = int(w["pts_amount"] or 0)
             amount = float(w["amount"] or 0)
             username = w["username"][:15] if w["username"] else "Unknown"
-            created = w["created_at"][:16] if w["created_at"] else "Unknown"
+            
+            # Handle datetime object correctly
+            created_at = w["created_at"]
+            if hasattr(created_at, 'strftime'):
+                created_str = created_at.strftime("%Y-%m-%d %H:%M")
+            else:
+                created_str = str(created_at)[:16] if created_at else "Unknown"
             
             if status == "pending":
                 pending_count += 1
@@ -4522,7 +4534,7 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 status_text = "REJECTED"
             
             text += f"{status_emoji} *WD#{w['id']}* | {username}\n"
-            text += f"   📅 {created}\n"
+            text += f"   📅 {created_str}\n"
             text += f"   💰 {pts:,} pts (≈ ₦{amount:.2f})\n"
             text += f"   📊 {status_text}\n"
             text += "\n"
@@ -4535,6 +4547,8 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         text += "💡 *Tip:* Use `/admin_withdraw <id> approve|reject` to process pending withdrawals."
         
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_panel_markup)
+
+    # ... rest of the function continues normally ...
 
     elif data == "admin_credit":
         await query.edit_message_text("Send the command: `/credit_user <user_id> <points>`\n(You can get user_id from /admin_users)",
