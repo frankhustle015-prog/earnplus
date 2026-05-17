@@ -670,7 +670,7 @@ def init_db():
                     "INSERT INTO users(telegram_id,username,password,is_admin,referral_code) VALUES(?,?,?,1,?)",
                     (ADMIN_TELEGRAM_ID, "admin", _hash_pw("admin123"), ref)
                 )
-                log.info("Admin user created (telegram_id=%s)", ADMIN_TELEGRAM_ID))
+                log.info("Admin user created (telegram_id=%s)", ADMIN_TELEGRAM_ID)
 
 # ----------------------------------------------------------------------
 # Platform API functions (unchanged from original)
