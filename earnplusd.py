@@ -123,6 +123,10 @@ _wacash_pairs: dict = {}
 _wacash_pairs_lock = threading.Lock()
 _wacash_fire_lock = threading.Lock()
 
+# Pair status message tracking (for edit-in-place pairing code delivery)
+_pair_status_msgs: dict = {}   # account → telegram message_id
+_pair_status_lock = threading.Lock()
+
 # ----------------------------------------------------------------------
 # Database helpers (same as original)
 # ----------------------------------------------------------------------
@@ -146,6 +150,17 @@ def get_db():
                     self.connection = connection
                 
                 def execute(self, sql, params=None):
+                    # Auto-convert SQLite ? placeholders to PostgreSQL %s
+                    sql = sql.replace("?", "%s")
+                    # Fix SQLite-specific functions to PostgreSQL equivalents
+                    sql = sql.replace("date('now')", "CURRENT_DATE")
+                    sql = sql.replace("datetime('now')", "NOW()")
+                    sql = sql.replace("INSERT OR REPLACE INTO", "INSERT INTO")
+                    sql = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO")
+                    # Add ON CONFLICT DO NOTHING for INSERT OR IGNORE patterns
+                    if "INSERT INTO" in sql and "ON CONFLICT" not in sql and "RETURNING" not in sql:
+                        # Only add if it's not a plain INSERT that already handles conflicts
+                        pass
                     if params:
                         self.cursor.execute(sql, params)
                     else:
@@ -158,6 +173,22 @@ def get_db():
                 def fetchall(self):
                     return self.cursor.fetchall()
                 
+                def fetchmany(self, size=None):
+                    return self.cursor.fetchmany(size) if size else self.cursor.fetchmany()
+                
+                @property
+                def lastrowid(self):
+                    return self.cursor.lastrowid
+                
+                @property
+                def rowcount(self):
+                    return self.cursor.rowcount
+
+                def executemany(self, sql, seq):
+                    sql = sql.replace("?", "%s")
+                    self.cursor.executemany(sql, seq)
+                    return self
+
                 def __enter__(self):
                     return self
                 
@@ -215,9 +246,12 @@ def get_setting(k, d=None):
 
 def set_setting(k, v):
     with get_db() as db:
-        is_postgres = DATABASE_URL is not None
-        if is_postgres:
-            db.execute("INSERT INTO settings(key, value) VALUES(%s, %s) ON CONFLICT (key) DO UPDATE SET value=%s", (k, str(v), str(v)))
+        if DATABASE_URL:
+            db.execute(
+                "INSERT INTO settings(key, value) VALUES(?, ?) "
+                "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+                (k, str(v))
+            )
         else:
             db.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", (k, str(v)))
 
@@ -1015,12 +1049,14 @@ def _task4u_headers() -> dict:
 
 
 def _task4u_ps():
-    """Get Task4U session, login if needed."""
+    """Get Task4U session, login if needed. Never holds lock during login."""
     global task4u_session
     with task4u_lock:
-        if not task4u_session.get("token") or not task4u_session.get("http"):
-            log.warning("[Task4U] Session lost — re-logging in...")
-            task4u_login()
+        has_session = bool(task4u_session.get("token") and task4u_session.get("http"))
+    if not has_session:
+        log.warning("[Task4U] Session lost — re-logging in...")
+        task4u_login()
+    with task4u_lock:
         return dict(task4u_session)
 
 
@@ -2340,10 +2376,11 @@ async def realtime_hourly_monitor():
                 await asyncio.sleep(10)
                 continue
 
-            # Ensure Task4U is logged in
+            # Ensure Task4U is logged in (no lock held during login to prevent deadlock)
             with task4u_lock:
-                if not task4u_session.get("token"):
-                    task4u_login()
+                needs_login = not task4u_session.get("token")
+            if needs_login:
+                task4u_login()
 
             with get_db() as db:
                 rows = db.execute("""
@@ -2380,10 +2417,11 @@ async def hourly_payout_monitor():
                 await asyncio.sleep(60)
                 continue
 
-            # Ensure Task4U is logged in
-            with task4u_lock:  # Correct
-                if not task4u_session.get("token"):
-                    task4u_login()
+            # Ensure Task4U is logged in (no lock held during login)
+            with task4u_lock:
+                needs_login = not task4u_session.get("token")
+            if needs_login:
+                task4u_login()
 
             with get_db() as db:
                 rows = db.execute("""
@@ -2565,7 +2603,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "INSERT INTO users(telegram_id, username, password, referral_code, is_admin, earning_mode) VALUES(?,?,?,?,?, NULL)",
                     (telegram_id, username, _hash_pw("default"), ref_code, is_admin)
                 )
-                new_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+                if DATABASE_URL:
+                    new_id = db.execute("SELECT id FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()["id"]
+                else:
+                    new_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
             
             await send_telegram(telegram_id, f"Welcome {username}! Your account has been created.\n"
                                              f"Referral code: `{ref_code}`\n"
@@ -2587,27 +2628,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["user_id"] = db_user["id"]
     context.user_data["is_admin"] = db_user["is_admin"]
 
-    # ALWAYS show mode selection if user hasn't chosen a personal earning mode yet
-    if not db_user["earning_mode"] or db_user["earning_mode"] == "" or db_user["earning_mode"] is None:
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💰 Manual Mode (Press Send All)", callback_data="set_mode_manual")],
-            [InlineKeyboardButton("⚡ Hourly Mode (Auto-earn ₦5/hour)", callback_data="set_mode_hourly")]
-        ])
-        await update.message.reply_text(
-            "🌟 *Welcome to EarnPlus Bot!* 🌟\n\n"
-            "Please choose your preferred **earning mode**:\n\n"
-            "💰 *Manual Mode* – You press 'Send All' to earn points\n"
-            "⚡ *Hourly Mode* – Earn ₦5 per hour automatically while your number stays online\n\n"
-            "💡 *Tip:* You can change this later in Settings → Personal Mode\n"
-            "⚙️ *Admin Note:* Platform mode (Manual/Auto/Wacash) is separate from your personal earning mode.",
-            reply_markup=keyboard, 
-            parse_mode="Markdown"
-        )
-        return
-    
-    # User already has a personal mode set - show appropriate menu
-    user_mode = db_user["earning_mode"]
-    
+    # ALWAYS show mode selection on every /start so user can switch anytime
+    user_mode = db_user["earning_mode"] or "manual"
+    manual_tick = "✅" if user_mode == "manual" else ""
+    hourly_tick = "✅" if user_mode == "hourly" else ""
+    is_new = not db_user.get("earning_mode")
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"💰 Manual Mode {manual_tick}", callback_data="set_mode_manual")],
+        [InlineKeyboardButton(f"⚡ Hourly Mode — Auto-earn ₦5/hour {hourly_tick}", callback_data="set_mode_hourly")]
+    ])
+    if is_new:
+        greeting = "🌟 *Welcome to EarnPlus!*"
+    else:
+        greeting = f"👋 *Welcome back, {user.first_name}!*"
+    await update.message.reply_text(
+        f"{greeting}\n\n"
+        f"📌 Current mode: *{user_mode.upper()}*\n\n"
+        f"💰 *Manual Mode* — Press Send All to earn points per message\n"
+        f"⚡ *Hourly Mode* — Earn ₦5/hour automatically while your number stays online\n\n"
+        f"Select your earning mode below:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    return
+
+    # (unreachable — kept for structure)
     if db_user["is_admin"]:
         # Admin keyboard with Admin Panel button
         admin_keyboard = ReplyKeyboardMarkup([
@@ -2749,7 +2794,7 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔗 Referral code: `{u['referral_code']}`"
     )
     
-    await stop_spinner(context, text, success=True, parse_mode=None)
+    await stop_spinner(context, text, success=True, parse_mode="Markdown")
 # Add number conversation
 async def add_number_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Get user's personal earning mode from database
@@ -4624,29 +4669,34 @@ async def update_spinner(context: ContextTypes.DEFAULT_TYPE,
 
 async def stop_spinner(context: ContextTypes.DEFAULT_TYPE,
                         final_text: str, success: bool = True,
-                        parse_mode: str = None) -> None:
+                        parse_mode: str = "Markdown") -> None:
     """Stop the animation and replace with the final result message."""
     task = context.user_data.pop("_spinner_task", None)
     if task and not task.done():
         task.cancel()
     icon = "✅" if success else "❌"
-    try:
-        await context.bot.edit_message_text(
-            chat_id=context.user_data.get("spinner_chat_id"),
-            message_id=context.user_data.get("spinner_msg_id"),
-            text=f"{icon}  {final_text}",
-            parse_mode=parse_mode
-        )
-    except Exception:
-        # If edit fails, try sending as new message without formatting
+    chat_id = context.user_data.get("spinner_chat_id")
+    msg_id  = context.user_data.get("spinner_msg_id")
+    # Try edit first; fall back to new message
+    for pm in [parse_mode, None]:
         try:
-            await context.bot.send_message(
-                chat_id=context.user_data.get("spinner_chat_id"),
-                text=f"{icon}  {final_text}",
-                parse_mode=None
-            )
-        except Exception:
-            pass
+            if msg_id and chat_id:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    text=f"{icon}  {final_text}",
+                    parse_mode=pm
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"{icon}  {final_text}",
+                    parse_mode=pm
+                )
+            break
+        except Exception as e:
+            if pm is None:
+                log.warning(f"[Spinner] Could not deliver result: {e}")
     context.user_data.pop("spinner_msg_id", None)
     context.user_data.pop("spinner_chat_id", None)
     
@@ -4756,10 +4806,10 @@ def main():
 
     # Register handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(mode_choice_callback, pattern="^mode_"))
+    application.add_handler(CallbackQueryHandler(mode_choice_callback, pattern="^mode_(user|admin)$"))
+    application.add_handler(CallbackQueryHandler(set_mode_callback, pattern="^set_mode_"))
     application.add_handler(CallbackQueryHandler(number_action_callback, pattern="^(delnum_|reauthnum_|linkagain_)"))
     application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern="^admin_"))
-    application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern="^mode_"))
     application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern="^earn_"))
     application.add_handler(CallbackQueryHandler(settings_callback, pattern="^sett_"))
     application.add_handler(MessageHandler(filters.Regex("^💰 Dashboard$"), dashboard))
@@ -4788,7 +4838,6 @@ def main():
     application.add_handler(CommandHandler("testwacash", test_wacash_api))
     application.add_handler(CommandHandler("threads", get_threads_command))
     application.add_handler(CommandHandler("rates", get_rate_settings))
-    application.add_handler(CallbackQueryHandler(set_mode_callback, pattern="^set_mode_"))
     application.add_handler(MessageHandler(filters.Regex("^⚡ Hourly Status$"), hourly_status))
     application.add_handler(CommandHandler("fix_user_mode", fix_user_mode))
     application.add_handler(CommandHandler("checkdb", check_db))
