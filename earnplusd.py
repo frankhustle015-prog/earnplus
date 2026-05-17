@@ -4454,87 +4454,17 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             text += f"{ban} `{r['username']}` – bal: {r['balance']:.0f} pts\n"
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_panel_markup)
 
-    elif text.startswith("/admin_withdraw"):
-    parts = text.split()
-    if len(parts) < 3:
-        await update.message.reply_text("Usage: /admin_withdraw <withdrawal_id> approve|reject [reason]\n\nExample: `/admin_withdraw 5 approve`\nGet withdrawal ID from Admin Panel → Withdrawals")
-        return
-    
-    try:
-        wd_id = int(parts[1])
-    except ValueError:
-        await update.message.reply_text("Invalid withdrawal ID. Please use a number.")
-        return
-    
-    action = parts[2].lower()
-    reason = " ".join(parts[3:]) if len(parts) > 3 else None
-    
-    if action not in ["approve", "reject"]:
-        await update.message.reply_text("Action must be 'approve' or 'reject'.")
-        return
-    
-    with get_db() as db:
-        # Get withdrawal details with user info
-        if DATABASE_URL:
-            wd = db.execute("""
-                SELECT w.*, u.username, u.telegram_id 
-                FROM withdrawals w 
-                JOIN users u ON w.user_id = u.id 
-                WHERE w.id = %s
-            """, (wd_id,)).fetchone()
-        else:
-            wd = db.execute("""
-                SELECT w.*, u.username, u.telegram_id 
-                FROM withdrawals w 
-                JOIN users u ON w.user_id = u.id 
-                WHERE w.id = ?
-            """, (wd_id,)).fetchone()
-        
-        if not wd:
-            await update.message.reply_text(f"❌ Withdrawal ID {wd_id} not found.")
+    elif data == "admin_withdrawals":
+        with get_db() as db:
+            wds = db.execute("SELECT w.id, u.username, w.amount, w.method, w.status, w.created_at FROM withdrawals w JOIN users u ON w.user_id=u.id WHERE w.status='pending' ORDER BY w.created_at ASC").fetchall()
+        if not wds:
+            await query.edit_message_text("No pending withdrawals.", reply_markup=admin_panel_markup)
             return
-        
-        if wd["status"] != "pending":
-            await update.message.reply_text(f"Withdrawal #{wd_id} is already {wd['status']}. Cannot change.")
-            return
-        
-        if action == "approve":
-            # Update withdrawal status
-            db.execute("UPDATE withdrawals SET status='approved', updated_at=CURRENT_TIMESTAMP WHERE id=?", (wd_id,))
-            _admin_log(db, get_internal_user_id(ADMIN_TELEGRAM_ID), "approve_withdrawal", f"WD#{wd_id}", 
-                      f"Amount: {wd['pts_amount']} pts for user {wd['username']}")
-            
-            # Notify user
-            await send_telegram(
-                wd["telegram_id"],
-                f"✅ *Withdrawal Approved!*\n\n"
-                f"💰 Amount: `{wd['pts_amount']:,}` points\n"
-                f"💵 ≈ ₦{wd['amount']:.2f}\n"
-                f"📅 Approved: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
-                f"Your funds will be sent to your registered account shortly.",
-                parse_mode="Markdown"
-            )
-            await update.message.reply_text(f"✅ Withdrawal #{wd_id} approved for {wd['username']} ({wd['pts_amount']} points)")
-            
-        else:  # reject
-            # Update withdrawal status and refund points
-            db.execute("UPDATE withdrawals SET status='rejected', reason=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", 
-                      (reason or "No reason provided", wd_id))
-            _credit(db, wd["user_id"], wd["pts_amount"], f"Refund for rejected withdrawal #{wd_id}")
-            _admin_log(db, get_internal_user_id(ADMIN_TELEGRAM_ID), "reject_withdrawal", f"WD#{wd_id}", 
-                      f"Reason: {reason or 'No reason'} for user {wd['username']}")
-            
-            # Notify user
-            await send_telegram(
-                wd["telegram_id"],
-                f"❌ *Withdrawal Rejected*\n\n"
-                f"💰 Amount: `{wd['pts_amount']:,}` points\n"
-                f"💵 ≈ ₦{wd['amount']:.2f}\n"
-                f"📝 Reason: {reason or 'Not specified'}\n\n"
-                f"Your points have been refunded to your balance.",
-                parse_mode="Markdown"
-            )
-            await update.message.reply_text(f"❌ Withdrawal #{wd_id} rejected for {wd['username']}. Points refunded.")
+        text = "⏳ *Pending Withdrawals*\n\n"
+        for w in wds:
+            text += f"ID: `{w['id']}` | {w['username']} | ₦{w['amount']:.2f} | {w['method']} | {w['created_at'][:10]}\n"
+        text += "\nTo approve/reject, use:\n/admin_withdraw <id> approve|reject [reason]"
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_panel_markup)
 
     elif data == "admin_credit":
         await query.edit_message_text("Send the command: `/credit_user <user_id> <points>`\n(You can get user_id from /admin_users)",
