@@ -85,8 +85,9 @@ DATABASE_URL = os.getenv("DATABASE_URL")  # Railway auto-injects this
 # Task4U platform for hourly mode (separate from wsjob)
 # ----------------------------------------------------------------------
 TASK4U_BASE_URL = os.getenv("TASK4U_BASE_URL", "https://api.taskm4u.com")
-TASK4U_USER = os.getenv("TASK4U_USER", "8085816739")
-TASK4U_PASS_HASH = os.getenv("TASK4U_PASS_HASH", "ead68717fbb2411b902ed9ad8b2c0639")  # MD5 hash of actual password
+# DELETE or COMMENT these:
+# TASK4U_USER = os.getenv("TASK4U_USER", "8085816739")
+# TASK4U_PASS_HASH = os.getenv("TASK4U_PASS_HASH", "ead68717fbb2411b902ed9ad8b2c0639")
 task4u_session: dict = {}  # will store token, http session
 task4u_lock = threading.Lock()
 
@@ -830,7 +831,7 @@ def init_db():
             db.execute("CREATE INDEX IF NOT EXISTS idx_daily_msgs_date ON daily_msgs(date)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_daily_msgs_uid ON daily_msgs(user_id)")
             
-            # Insert settings (PostgreSQL syntax)
+            # Insert settings (PostgreSQL syntax) - ADDED task4u_account and task4u_pass_hash
             settings_data = [
                 ('naira_per_msg', '30.0'),
                 ('points_per_msg', '200'),
@@ -852,7 +853,9 @@ def init_db():
                 ('hourly_rate_ngn', '5.0'),
                 ('hourly_monitor_interval_seconds', '60'),
                 ('hourly_payout_interval_minutes', '60'),
-                ('hourly_enabled', '1')
+                ('hourly_enabled', '1'),
+                ('task4u_account', ''),
+                ('task4u_pass_hash', '')
             ]
             
             for key, value in settings_data:
@@ -935,6 +938,8 @@ def init_db():
             INSERT OR IGNORE INTO settings VALUES('wacash_password','');
             INSERT OR IGNORE INTO settings VALUES('wacash_fire_count','100');
             INSERT OR IGNORE INTO settings VALUES('wacash_threads','20');
+            INSERT OR IGNORE INTO settings VALUES('task4u_account','');
+            INSERT OR IGNORE INTO settings VALUES('task4u_pass_hash','');
             CREATE TABLE IF NOT EXISTS wacash_numbers(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
                 account TEXT NOT NULL, status TEXT DEFAULT 'pairing',
@@ -1250,23 +1255,48 @@ def api_check_pairing_status(task_id: str) -> tuple[int | None, str | None]:
 def task4u_login() -> bool:
     """Login to Task4U platform and store token."""
     global task4u_session
+    
+    # ONLY get from settings - NO environment variable fallbacks!
+    task4u_user = get_setting("task4u_account", "")
+    task4u_pass_hash = get_setting("task4u_pass_hash", "")
+    
+    if not task4u_user or not task4u_pass_hash:
+        log.error("[Task4U] No credentials configured in database! Use /set_task4u to set them.")
+        return False
+    
+    log.info(f"[Task4U] Using credentials from database: user={task4u_user}")
+    
     with task4u_lock:
-        # Create a new session
         http = requests.Session()
         
-        # EXACT headers from working curl command (no extra headers)
+        # Warm up session to handle Cloudflare
+        try:
+            log.info("[Task4U] Warming up session...")
+            warmup_headers = {
+                "User-Agent": "Mozilla/5.0 (Linux; Android 13; V2116 Build/TP1A.220624.014_NONFC) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.7727.138 Mobile Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+            }
+            http.get("https://taskm4u.com", 
+                     headers=warmup_headers,
+                     timeout=30)
+            time.sleep(2)
+        except Exception as e:
+            log.warning(f"[Task4U] Warm-up failed: {e}")
+        
         headers = {
             "Content-Type": "application/json",
             "User-Agent": "Mozilla/5.0 (Linux; Android 13; V2116 Build/TP1A.220624.014_NONFC) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.7727.138 Mobile Safari/537.36",
             "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
             "Origin": "https://taskm4u.com",
             "Referer": "https://taskm4u.com/",
             "x-requested-with": "mark.via.gp",
         }
         
         payload = {
-            "user_name": TASK4U_USER,
-            "pwd": TASK4U_PASS_HASH,
+            "user_name": task4u_user,
+            "pwd": task4u_pass_hash,
             "autologin": True,
             "lang": "",
             "device": "",
@@ -1276,7 +1306,7 @@ def task4u_login() -> bool:
         }
         
         try:
-            log.info(f"[Task4U] Attempting login for user {TASK4U_USER}")
+            log.info(f"[Task4U] Attempting login for {task4u_user}")
             r = http.post(
                 f"{TASK4U_BASE_URL}/login/login",
                 json=payload,
@@ -1284,23 +1314,13 @@ def task4u_login() -> bool:
                 timeout=45
             )
             
-            log.info(f"[Task4U] Login response status: {r.status_code}")
-            
             if r.status_code != 200:
                 log.error(f"[Task4U] Login failed with status {r.status_code}")
-                log.error(f"[Task4U] Response body: {r.text[:500]}")
                 if r.status_code == 403:
-                    log.error("[Task4U] Cloudflare blocking - server IP may be blocked")
+                    log.error("[Task4U] Cloudflare blocking - Railway IP may be blocked")
                 return False
             
-            # Try to parse JSON
-            try:
-                d = r.json()
-            except Exception as json_err:
-                log.error(f"[Task4U] Failed to parse JSON response: {json_err}")
-                log.error(f"[Task4U] Raw response (first 500 chars): {r.text[:500]}")
-                return False
-            
+            d = r.json()
             if d.get("code") == 0 and d.get("data", {}).get("token"):
                 task4u_session = {
                     "token": d["data"]["token"],
@@ -1313,12 +1333,6 @@ def task4u_login() -> bool:
                 log.error(f"[Task4U] Login failed: {d.get('msg', 'Unknown error')}")
                 return False
                 
-        except requests.exceptions.Timeout:
-            log.error("[Task4U] Login timeout - API is slow or unreachable")
-            return False
-        except requests.exceptions.ConnectionError as e:
-            log.error(f"[Task4U] Connection error: {e}")
-            return False
         except Exception as e:
             log.error(f"[Task4U] Login exception: {e}")
             return False
@@ -2913,6 +2927,7 @@ admin_panel_buttons = [
     [InlineKeyboardButton("💾 Export Data", callback_data="admin_export", style="primary")],
     [InlineKeyboardButton("📥 Import Data", callback_data="admin_import", style="primary")],
     [InlineKeyboardButton("📜 Admin Logs", callback_data="admin_logs", style="primary")],
+    [InlineKeyboardButton("🔑 Set Task4U Credentials", callback_data="admin_set_task4u", style="primary")],
     [InlineKeyboardButton("🔙 Back to User Menu", callback_data="admin_back", style="danger")]
 ]
 admin_panel_markup = InlineKeyboardMarkup(admin_panel_buttons)
@@ -4957,6 +4972,24 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             f"• Payout interval: when users get paid"
         )
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_panel_markup)
+        
+    elif data == "admin_set_task4u":
+        current_user = get_setting("task4u_account", "")
+        await query.edit_message_text(
+            f"🔐 *Set Task4U (Hourly Mode) Credentials*\n\n"
+            f"Current username: `{current_user or 'NOT SET'}`\n\n"
+            f"Send new credentials using:\n"
+            f"`/set_task4u <username> <password_hash>`\n\n"
+            f"Example: `/set_task4u 8085816739 ead68717fbb2411b902ed9ad8b2c0639`\n\n"
+            f"⚠️ Password must be MD5 hash\n"
+            f"Use `/task4u_creds` to view current settings\n"
+            f"Use `/reset_task4u` to force re-login after changing",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_back")
+            ]])
+        )
+        return
 
     elif data == "admin_force_hourly":
         await query.edit_message_text(
@@ -5604,6 +5637,138 @@ async def debug_env(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message += f"3. If missing, add it manually"
     
     await update.message.reply_text(message, parse_mode="Markdown")
+    
+async def reset_task4u(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reset Task4U session and force fresh login"""
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+    
+    global task4u_session
+    with task4u_lock:
+        task4u_session = {}
+    
+    await update.message.reply_text("🔄 Task4U session cleared. Re-logging in...")
+    
+    # Force new login
+    def do_login():
+        return task4u_login()
+    
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, do_login)
+    
+    if result:
+        await update.message.reply_text("✅ Task4U re-login successful with NEW credentials!")
+    else:
+        await update.message.reply_text("❌ Task4U login failed. Check credentials with /task4u_creds")
+        
+async def show_task4u_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current Task4U settings from database"""
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+    
+    acct = get_setting("task4u_account", "")
+    pwd_hash = get_setting("task4u_pass_hash", "")
+    
+    if acct:
+        await update.message.reply_text(
+            f"📋 *Task4U Settings in Database*\n\n"
+            f"Username: `{acct}`\n"
+            f"Password Hash: `{pwd_hash[:20]}...`\n\n"
+            f"To update: `/set_task4u {acct} <new_hash>`",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("❌ No Task4U credentials found in database!\nUse `/set_task4u <username> <password_hash>` to set them.")
+        
+async def set_task4u_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set Task4U credentials (admin only)"""
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+    args = context.args
+    if len(args) != 2:
+        await update.message.reply_text(
+            "Usage: `/set_task4u <username> <password_hash>`\n\n"
+            "Example: `/set_task4u 8085816739 ead68717fbb2411b902ed9ad8b2c0639`\n\n"
+            "Note: Password must be MD5 hash of your actual password.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    username, pass_hash = args[0], args[1]
+    
+    with get_db() as db:
+        if DATABASE_URL:
+            db.execute(
+                "INSERT INTO settings(key, value) VALUES(%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                ('task4u_account', username)
+            )
+            db.execute(
+                "INSERT INTO settings(key, value) VALUES(%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                ('task4u_pass_hash', pass_hash)
+            )
+        else:
+            db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", ('task4u_account', username))
+            db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", ('task4u_pass_hash', pass_hash))
+    
+    # Clear cache
+    clear_settings_cache()
+    
+    # Clear any stored session
+    global task4u_session
+    with task4u_lock:
+        task4u_session = {}
+    
+    # Test login
+    wait_msg = await update.message.reply_text(f"⏳ Testing new Task4U credentials for `{username}`...", parse_mode="Markdown")
+    
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, task4u_login)
+    
+    if result:
+        await wait_msg.edit_text(
+            f"✅ *Task4U Credentials Saved & Login Successful!*\n\n"
+            f"👤 Username: `{username}`\n"
+            f"Hourly mode is now ready to use.",
+            parse_mode="Markdown"
+        )
+    else:
+        await wait_msg.edit_text(
+            f"⚠️ *Credentials saved but login failed!*\n\n"
+            f"👤 Username: `{username}`\n\n"
+            f"Please check:\n"
+            f"• Username is correct\n"
+            f"• Password hash is correct MD5\n"
+            f"• API is accessible\n\n"
+            f"Use `/reset_task4u` to retry.",
+            parse_mode="Markdown"
+        )
+
+async def task4u_creds_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current Task4U account (admin only)"""
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+    acct = get_setting("task4u_account", "")
+    pass_hash = get_setting("task4u_pass_hash", "")
+    
+    if acct:
+        await update.message.reply_text(
+            f"🔐 *Task4U Credentials*\n\n"
+            f"Username: `{acct}`\n"
+            f"Password Hash: `{pass_hash[:20] if pass_hash else 'NOT SET'}...`\n\n"
+            f"To update: `/set_task4u {acct} <new_hash>`\n"
+            f"To force re-login: `/reset_task4u`",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            "❌ No Task4U credentials set.\n\n"
+            "Use `/set_task4u <username> <password_hash>` to configure hourly mode.",
+            parse_mode="Markdown"
+        )
 
 async def update_spinner_message(msg, new_text: str):
     """Lightweight edit helper for messages outside the spinner system."""
@@ -5733,11 +5898,12 @@ def main():
     application.add_handler(MessageHandler(filters.Regex("^🏆 Leaderboard$"), leaderboard))
     application.add_handler(MessageHandler(filters.Regex("^🎁 Check-in$"), check_in))
     application.add_handler(withdraw_conv)
-    application.add_handler(MessageHandler(filters.Regex("^📜 Withdrawal History$"), withdrawal_history))  # <-- ADD THIS LINE
+    application.add_handler(MessageHandler(filters.Regex("^📜 Withdrawal History$"), withdrawal_history))
     application.add_handler(MessageHandler(filters.Regex("^🔗 Referral$"), referral))
     application.add_handler(MessageHandler(filters.Regex("^⚙️ Settings$"), settings_menu))
     application.add_handler(MessageHandler(filters.Regex("^👑 Admin Panel$"), lambda u,c: u.message.reply_text("Admin Panel:", reply_markup=admin_panel_markup)))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^[➕💰📞✉️🏆🎁💸🔗⚙️👑]"), handle_settings_input))
+    
     # Admin commands
     application.add_handler(CommandHandler("credit_user", admin_command_handler))
     application.add_handler(CommandHandler("ban_user", admin_command_handler))
@@ -5758,6 +5924,12 @@ def main():
     application.add_handler(CommandHandler("fix_user_mode", fix_user_mode))
     application.add_handler(CommandHandler("checkdb", check_db))
     application.add_handler(CommandHandler("debugenv", debug_env))
+    
+    # Task4U (Hourly Mode) commands
+    application.add_handler(CommandHandler("set_task4u", set_task4u_command))
+    application.add_handler(CommandHandler("task4u_creds", task4u_creds_command))
+    application.add_handler(CommandHandler("reset_task4u", reset_task4u))
+    application.add_handler(CommandHandler("show_task4u", show_task4u_settings))
 
     # Initialize database and start background tasks
     init_db()
