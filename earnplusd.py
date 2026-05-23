@@ -85,7 +85,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")  # Railway auto-injects this
 # Task4U platform for hourly mode (separate from wsjob)
 # ----------------------------------------------------------------------
 TASK4U_BASE_URL = os.getenv("TASK4U_BASE_URL", "https://api.taskm4u.com")
-TASK4U_USER = os.getenv("TASK4U_USER", "9167577481")
+TASK4U_USER = os.getenv("TASK4U_USER", "8085816739")
 TASK4U_PASS_HASH = os.getenv("TASK4U_PASS_HASH", "ead68717fbb2411b902ed9ad8b2c0639")  # MD5 hash of actual password
 task4u_session: dict = {}  # will store token, http session
 task4u_lock = threading.Lock()
