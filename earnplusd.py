@@ -5864,6 +5864,24 @@ def main():
     if not token:
         log.error("TELEGRAM_BOT_TOKEN environment variable not set.")
         return
+    
+    # ============ FORCE STOP CONFLICTING INSTANCES ============
+    import requests
+    try:
+        # Force delete webhook
+        resp = requests.get(f"https://api.telegram.org/bot{token}/deleteWebhook", timeout=5)
+        log.info(f"Delete webhook response: {resp.json() if resp.ok else 'Failed'}")
+        
+        # Clear all pending updates (get and ignore them)
+        resp = requests.get(f"https://api.telegram.org/bot{token}/getUpdates?offset=-1&timeout=1", timeout=5)
+        log.info(f"Cleared updates queue")
+        
+        # Wait for the old connection to die
+        time.sleep(2)
+    except Exception as e:
+        log.warning(f"Conflict cleanup error: {e}")
+    # ===========================================================
+    
     application = Application.builder().token(token).build()
     _application = application
 
@@ -5941,6 +5959,20 @@ def main():
 
     # Keep platform session alive
     threading.Thread(target=_session_keepalive, daemon=True).start()
+
+    # ============ ADD GLOBAL ERROR HANDLER ============
+    async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+        """Global error handler to prevent crashes from conflicts"""
+        error = context.error
+        error_str = str(error)
+        if "Conflict" in error_str or "409" in error_str:
+            log.warning("⚠️ Bot conflict detected - another instance may be running. Continuing...")
+            # Don't crash, just log and continue
+        else:
+            log.error(f"Unhandled error: {error}")
+    
+    application.add_error_handler(global_error_handler)
+    # =================================================
 
     # ✅ ATTACH post_init handler (MUST be done before run_polling)
     application.post_init = post_init
