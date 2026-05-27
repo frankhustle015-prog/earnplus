@@ -3282,6 +3282,399 @@ async def add_number_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
     return TYPING_NUMBER
+    
+async def handle_direct_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle when user directly sends a phone number in chat"""
+    user = update.effective_user
+    telegram_id = user.id
+    
+    # Check if user is registered
+    uid = get_internal_user_id(telegram_id)
+    if not uid:
+        await update.message.reply_text("Please use /start to register first.")
+        return
+    
+    text = update.message.text.strip()
+    
+    # Check if it's a phone number with space format
+    if " " not in text:
+        await update.message.reply_text(
+            "❌ *Invalid Format*\n\n"
+            "Please send your number with a space between the country code and the local number.\n\n"
+            "✅ *Correct format:* `+31 97010545858`\n"
+            "❌ *Wrong format:* `+3197010545858`\n\n"
+            "Example:\n"
+            "• `+234 9157338416`\n"
+            "• `+31 97010545858`\n"
+            "• `+1 2345678901`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Parse the number
+    parts = text.strip().split(None, 1)
+    if len(parts) != 2:
+        await update.message.reply_text("❌ Invalid format. Use: `+31 97010545858`", parse_mode="Markdown")
+        return
+    
+    country_code = re.sub(r"[^\d+]", "", parts[0])
+    local_number = re.sub(r"[^\d]", "", parts[1])
+    
+    if not country_code or not local_number:
+        await update.message.reply_text("❌ Invalid number format. Use: `+31 97010545858`", parse_mode="Markdown")
+        return
+    
+    # Ensure country_code starts with +
+    if not country_code.startswith("+"):
+        country_code = "+" + country_code
+    
+    original_number = country_code + local_number
+    if len(original_number) < 7 or len(original_number) > 20:
+        await update.message.reply_text("❌ Invalid number length.", parse_mode="Markdown")
+        return
+    
+    # Store in context for retry variants
+    context.user_data["pending_number_original"] = original_number
+    context.user_data["pending_country_code"] = country_code
+    context.user_data["pending_local_number"] = local_number
+    
+    # Get user's earning mode
+    with get_db() as db:
+        user_row = db.execute("SELECT earning_mode FROM users WHERE id=?", (uid,)).fetchone()
+        user_mode = user_row["earning_mode"] if user_row else "manual"
+    
+    # Process based on mode
+    if user_mode == "hourly":
+        await process_hourly_number(update, context, uid, telegram_id, original_number, country_code, local_number)
+    else:
+        await process_manual_number(update, context, uid, telegram_id, original_number, country_code, local_number)
+
+
+async def process_hourly_number(update: Update, context: ContextTypes.DEFAULT_TYPE, uid, telegram_id, original_number, country_code, local_number):
+    """Process number for hourly mode with variants"""
+    await update.message.reply_text(
+        f"🔄 *Processing Number for Hourly Mode*\n\n"
+        f"📱 Original: `{original_number}`\n"
+        f"🌍 Country: `{country_code}`\n"
+        f"🔢 Local: `{local_number}`\n\n"
+        f"🔄 Will try multiple variants if needed...",
+        parse_mode="Markdown"
+    )
+    
+    # Try variants sequentially
+    variants = generate_number_variants(original_number, country_code, local_number)
+    
+    for variant in variants:
+        # Check if already paired
+        with get_db() as db:
+            ex = db.execute("SELECT status FROM numbers WHERE user_id=? AND account=?", (uid, variant)).fetchone()
+            if ex and ex["status"] == "online":
+                await update.message.reply_text(f"✅ Number `{variant}` is already online!", parse_mode="Markdown")
+                return
+            elif ex:
+                db.execute("""
+                    UPDATE numbers 
+                    SET status='pairing', pair_code=NULL, wsid=NULL, hourly_status='pending'
+                    WHERE user_id=? AND account=?
+                """, (uid, variant))
+            else:
+                db.execute("""
+                    INSERT INTO numbers(user_id, account, status, hourly_status) 
+                    VALUES(?,?, 'pairing', 'pending')
+                """, (uid, variant))
+        
+        await update.message.reply_text(f"🔄 Trying variant: `{variant}`...", parse_mode="Markdown")
+        
+        # Try to pair this variant
+        success = await try_hourly_pairing(update, context, uid, telegram_id, variant)
+        
+        if success:
+            await update.message.reply_text(
+                f"✅ *Success!* Number `{variant}` is now paired and online!\n\n"
+                f"You will earn ₦{get_setting('hourly_rate_ngn', '5')}/hour automatically.",
+                parse_mode="Markdown"
+            )
+            return
+    
+    await update.message.reply_text(
+        f"❌ *Failed to pair any variant*\n\n"
+        f"Tried {len(variants)} variants for `{original_number}`.\n"
+        f"Please check the number and try again.",
+        parse_mode="Markdown"
+    )
+
+
+async def process_manual_number(update: Update, context: ContextTypes.DEFAULT_TYPE, uid, telegram_id, original_number, country_code, local_number):
+    """Process number for manual mode with variants"""
+    platform_mode = get_earning_mode()
+    
+    await update.message.reply_text(
+        f"🔄 *Processing Number*\n\n"
+        f"📱 Original: `{original_number}`\n"
+        f"🌍 Country: `{country_code}`\n"
+        f"🔢 Local: `{local_number}`\n"
+        f"📡 Mode: {platform_mode.upper()}\n\n"
+        f"🔄 Will try multiple variants if needed...",
+        parse_mode="Markdown"
+    )
+    
+    # Store in active_pairs
+    with pairs_lock:
+        active_pairs[original_number] = {
+            "user_id": uid, "pair_code": None, "status": "pairing",
+            "wsid": None, "cancelled": False, "original": original_number,
+            "country_prefix": country_code.lstrip("+"), "local_part": local_number,
+        }
+    
+    # Try variants sequentially
+    variants = generate_number_variants(original_number, country_code, local_number)
+    
+    for variant in variants:
+        # Check if already in DB
+        with get_db() as db:
+            ex = db.execute("SELECT status FROM numbers WHERE user_id=? AND account=?", (uid, variant)).fetchone()
+            if ex and ex["status"] == "online":
+                await update.message.reply_text(f"✅ Number `{variant}` is already online!", parse_mode="Markdown")
+                return
+            elif ex:
+                db.execute("UPDATE numbers SET status='pairing', pair_code=NULL, wsid=NULL WHERE user_id=? AND account=?", (uid, variant))
+            else:
+                db.execute("INSERT INTO numbers(user_id, account, status) VALUES(?,?,'pairing')", (uid, variant))
+        
+        await update.message.reply_text(f"🔄 Trying variant: `{variant}`...", parse_mode="Markdown")
+        
+        # Update active_pairs for this variant
+        with pairs_lock:
+            active_pairs[variant] = {
+                "user_id": uid, "pair_code": None, "status": "pairing",
+                "wsid": None, "cancelled": False, "original": original_number,
+                "country_prefix": country_code.lstrip("+"), "local_part": local_number,
+            }
+        
+        # Try to pair this variant
+        success = await try_manual_pairing(update, context, uid, telegram_id, variant)
+        
+        if success:
+            await update.message.reply_text(
+                f"✅ *Success!* Number `{variant}` is now paired and online!",
+                parse_mode="Markdown"
+            )
+            return
+    
+    await update.message.reply_text(
+        f"❌ *Failed to pair any variant*\n\n"
+        f"Tried {len(variants)} variants for `{original_number}`.\n"
+        f"Please check the number and try again.",
+        parse_mode="Markdown"
+    )
+
+
+def generate_number_variants(original: str, country_code: str, local_number: str) -> list:
+    """Generate number variants by adding zeros to the local number"""
+    variants = [original]  # Start with original
+    
+    # Clean local number (remove any existing zeros at start)
+    clean_local = local_number.lstrip("0")
+    
+    # Generate variants with increasing zeros
+    for zero_count in range(1, 5):  # Add 1 to 4 zeros
+        zeros = "0" * zero_count
+        variant_local = zeros + clean_local
+        variant = country_code + variant_local
+        variants.append(variant)
+    
+    return list(dict.fromkeys(variants))  # Remove duplicates
+
+
+async def try_hourly_pairing(update: Update, context: ContextTypes.DEFAULT_TYPE, uid, telegram_id, number: str) -> bool:
+    """Attempt to pair a number for hourly mode, returns True if successful"""
+    # Ensure Task4U is logged in
+    with task4u_lock:
+        if not task4u_session.get("token"):
+            task4u_login()
+    
+    # Get pairing code
+    code, err = task4u_get_pairing_code(number)
+    
+    if not code:
+        return False
+    
+    # Send code to user
+    await send_telegram(
+        telegram_id,
+        f"🔐 *Hourly Mode Pairing Code*\n\n"
+        f"📱 Number: `{number}`\n"
+        f"🔑 Code: `{code}`\n\n"
+        f"1. Open WhatsApp → Settings → Linked Devices\n"
+        f"2. Tap *Link a Device* → *Link with phone number*\n"
+        f"3. Enter the code above\n\n"
+        f"⏳ Code expires in ~2 minutes.\n\n"
+        f"Once connected, you will automatically earn ₦{get_setting('hourly_rate_ngn', '5')}/hour!",
+        parse_mode="Markdown"
+    )
+    
+    # Poll for online status (max 5 minutes)
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        online_set = task4u_get_online_numbers()
+        if number in online_set:
+            # Success! Get hosting time
+            current_seconds = task4u_get_hosting_time(number)
+            current_hours = (current_seconds // 3600) if current_seconds else 0
+            
+            with get_db() as db:
+                if DATABASE_URL:
+                    db.execute("""
+                        UPDATE numbers
+                        SET status='online', hourly_status='online',
+                            hourly_start_time = CURRENT_TIMESTAMP,
+                            platform_hours_at_start = %s,
+                            last_hourly_payout_time = CURRENT_TIMESTAMP,
+                            pair_code = NULL
+                        WHERE user_id=%s AND account=%s
+                    """, (current_hours, uid, number))
+                else:
+                    db.execute("""
+                        UPDATE numbers
+                        SET status='online', hourly_status='online',
+                            hourly_start_time = CURRENT_TIMESTAMP,
+                            platform_hours_at_start = ?,
+                            last_hourly_payout_time = CURRENT_TIMESTAMP,
+                            pair_code = NULL
+                        WHERE user_id=? AND account=?
+                    """, (current_hours, uid, number))
+            
+            await send_telegram(
+                telegram_id,
+                f"✅ *NUMBER ONLINE!*\n\n"
+                f"📱 `{number}`\n"
+                f"💰 Mode: Hourly (₦{get_setting('hourly_rate_ngn', '5')}/hour)\n"
+                f"🟢 Status: Online and earning\n\n"
+                f"You will earn ₦{get_setting('hourly_rate_ngn', '5')} every hour automatically.",
+                parse_mode="Markdown"
+            )
+            return True
+        
+        await asyncio.sleep(5)
+    
+    return False
+
+
+async def try_manual_pairing(update: Update, context: ContextTypes.DEFAULT_TYPE, uid, telegram_id, number: str) -> bool:
+    """Attempt to pair a number for manual mode, returns True if successful"""
+    # Get pairing code
+    pair_code = None
+    for i in range(MAX_RETRIES):
+        code, _ = api_get_code(number)
+        if code:
+            pair_code = code
+            break
+        await asyncio.sleep(min(i + 1, 5))
+    
+    if not pair_code:
+        return False
+    
+    # Update DB with code
+    with get_db() as db:
+        if DATABASE_URL:
+            db.execute("UPDATE numbers SET pair_code=%s WHERE user_id=%s AND account=%s", (pair_code, uid, number))
+        else:
+            db.execute("UPDATE numbers SET pair_code=? WHERE user_id=? AND account=?", (pair_code, uid, number))
+    
+    # Send code to user
+    next_variant = _next_number_variant(number, number)
+    btn_row = []
+    if next_variant:
+        btn_row.append(InlineKeyboardButton(
+            f"🔄 Link Next: {next_variant}",
+            callback_data=f"linkagain_{number}__{next_variant}",
+            style="success"
+        ))
+    
+    link_again_kb = InlineKeyboardMarkup([btn_row]) if btn_row else None
+    
+    await send_telegram(
+        telegram_id,
+        f"🔐 *Pairing Code Ready!*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📱 Number: `{number}`\n"
+        f"🔑 Code: `{pair_code}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"*Steps to link:*\n"
+        f"1️⃣ Open WhatsApp\n"
+        f"2️⃣ Go to Settings → Linked Devices\n"
+        f"3️⃣ Tap Link a Device\n"
+        f"4️⃣ Select *Link with phone number*\n"
+        f"5️⃣ Enter the code above\n\n"
+        f"⏳ Code expires in ~3 minutes.\n"
+        f"{'Tap below to try the next number variant.' if next_variant else 'No more variants — tap to retry this number.'}",
+        parse_mode="Markdown",
+        reply_markup=link_again_kb
+    )
+    
+    # Poll for phone status (2 hours max)
+    elapsed = 0
+    interval = 3
+    
+    while elapsed < 7200:
+        with pairs_lock:
+            if active_pairs.get(number, {}).get("cancelled"):
+                with get_db() as db:
+                    db.execute("DELETE FROM numbers WHERE user_id=? AND account=?", (uid, number))
+                return False
+        
+        status = api_phonestatus(number)
+        if status == 1:
+            # Phone came online
+            ok, reg_msg = api_addwsnumber(number)
+            log.info(f"[Pair] addwsnumber {number}: ok={ok} msg={reg_msg}")
+            
+            # Get wsid
+            time.sleep(3)
+            wsid = None
+            for attempt in range(6):
+                wsid = api_get_wsid(number)
+                if wsid:
+                    break
+                await asyncio.sleep(4)
+            
+            if wsid:
+                today = datetime.utcnow().strftime("%Y-%m-%d")
+                with get_db() as db:
+                    if DATABASE_URL:
+                        db.execute(
+                            "UPDATE numbers SET status='online',wsid=%s,pair_code=NULL WHERE user_id=%s AND account=%s",
+                            (wsid, uid, number)
+                        )
+                        db.execute("DELETE FROM daily_msgs WHERE user_id=%s AND date=%s", (uid, today))
+                    else:
+                        db.execute(
+                            "UPDATE numbers SET status='online',wsid=?,pair_code=NULL WHERE user_id=? AND account=?",
+                            (wsid, uid, number)
+                        )
+                        db.execute("DELETE FROM daily_msgs WHERE user_id=? AND date=?", (uid, today))
+                
+                await send_telegram(
+                    telegram_id,
+                    f"🟢 *Number Connected Successfully!*\n\n"
+                    f"📱 `{number}` is now online and ready to earn.\n"
+                    f"You may now use *Send All* to begin sending messages.",
+                    parse_mode="Markdown"
+                )
+                return True
+        
+        # Adaptive polling
+        if elapsed < 300:
+            interval = 3
+        elif elapsed < 1800:
+            interval = 10
+        else:
+            interval = 30
+        
+        await asyncio.sleep(interval)
+        elapsed += interval
+    
+    return False
 
 async def add_number_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = update.effective_user.id
@@ -5920,7 +6313,15 @@ def main():
     application.add_handler(MessageHandler(filters.Regex("^🔗 Referral$"), referral))
     application.add_handler(MessageHandler(filters.Regex("^⚙️ Settings$"), settings_menu))
     application.add_handler(MessageHandler(filters.Regex("^👑 Admin Panel$"), lambda u,c: u.message.reply_text("Admin Panel:", reply_markup=admin_panel_markup)))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^[➕💰📞✉️🏆🎁💸🔗⚙️👑]"), handle_settings_input))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^[➕💰📞✉️🏆🎁💸🔗⚙️👑⚡]"), handle_settings_input))
+    
+    # ============ ADD DIRECT NUMBER HANDLER (BEFORE ADMIN COMMANDS) ============
+    # Handle direct phone numbers sent in chat (without needing Add Number button)
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & ~filters.Regex("^[➕💰📞✉️🏆🎁💸🔗⚙️👑⚡]"),
+        handle_direct_number
+    ))
+    # ==========================================================================
     
     # Admin commands
     application.add_handler(CommandHandler("credit_user", admin_command_handler))
