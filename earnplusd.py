@@ -6669,7 +6669,7 @@ def main():
     )
 
     # Register handlers
-    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("start", start), group=-1)
     application.add_handler(CallbackQueryHandler(mode_choice_callback, pattern="^mode_(user|admin)$"))
     application.add_handler(CallbackQueryHandler(set_mode_callback, pattern="^set_mode_"))
     application.add_handler(CallbackQueryHandler(number_action_callback, pattern="^(delnum_|reauthnum_|linkagain_)"))
@@ -6696,37 +6696,37 @@ def main():
     ))
     
     # Admin commands
-    application.add_handler(CommandHandler("credit_user", admin_command_handler))
-    application.add_handler(CommandHandler("ban_user", admin_command_handler))
-    application.add_handler(CommandHandler("gen_code", admin_command_handler))
-    application.add_handler(CommandHandler("broadcast", admin_command_handler))
-    application.add_handler(CommandHandler("testsend", test_send))
-    application.add_handler(CommandHandler("admin_withdraw", admin_command_handler))
+    application.add_handler(CommandHandler("credit_user", admin_command_handler), group=-1)
+    application.add_handler(CommandHandler("ban_user", admin_command_handler), group=-1)
+    application.add_handler(CommandHandler("gen_code", admin_command_handler), group=-1)
+    application.add_handler(CommandHandler("broadcast", admin_command_handler), group=-1)
+    application.add_handler(CommandHandler("testsend", test_send), group=-1)
+    application.add_handler(CommandHandler("admin_withdraw", admin_command_handler), group=-1)
     application.add_handler(MessageHandler(filters.Document.ALL, handle_import_doc))
-    application.add_handler(CommandHandler("wacash_creds", wacash_creds_command))
-    application.add_handler(CommandHandler("set_wacash", set_wacash_command))
-    application.add_handler(CommandHandler("debug_mode", debug_mode))
-    application.add_handler(CommandHandler("force_mode", force_mode))
-    application.add_handler(CommandHandler("testwacash", test_wacash_api))
-    application.add_handler(CommandHandler("threads", get_threads_command))
-    application.add_handler(CommandHandler("rates", get_rate_settings))
+    application.add_handler(CommandHandler("wacash_creds", wacash_creds_command), group=-1)
+    application.add_handler(CommandHandler("set_wacash", set_wacash_command), group=-1)
+    application.add_handler(CommandHandler("debug_mode", debug_mode), group=-1)
+    application.add_handler(CommandHandler("force_mode", force_mode), group=-1)
+    application.add_handler(CommandHandler("testwacash", test_wacash_api), group=-1)
+    application.add_handler(CommandHandler("threads", get_threads_command), group=-1)
+    application.add_handler(CommandHandler("rates", get_rate_settings), group=-1)
     application.add_handler(MessageHandler(filters.Regex("^⚡ Hourly Status$"), hourly_status))
-    application.add_handler(CommandHandler("hourly", hourly_status))
-    application.add_handler(CommandHandler("fix_user_mode", fix_user_mode))
-    application.add_handler(CommandHandler("checkdb", check_db))
-    application.add_handler(CommandHandler("debugenv", debug_env))
+    application.add_handler(CommandHandler("hourly", hourly_status), group=-1)
+    application.add_handler(CommandHandler("fix_user_mode", fix_user_mode), group=-1)
+    application.add_handler(CommandHandler("checkdb", check_db), group=-1)
+    application.add_handler(CommandHandler("debugenv", debug_env), group=-1)
     
     # Task4U (Hourly Mode) commands
-    application.add_handler(CommandHandler("set_task4u", set_task4u_command))
-    application.add_handler(CommandHandler("task4u_creds", task4u_creds_command))
-    application.add_handler(CommandHandler("reset_task4u", reset_task4u))
-    application.add_handler(CommandHandler("show_task4u", show_task4u_settings))
+    application.add_handler(CommandHandler("set_task4u", set_task4u_command), group=-1)
+    application.add_handler(CommandHandler("task4u_creds", task4u_creds_command), group=-1)
+    application.add_handler(CommandHandler("reset_task4u", reset_task4u), group=-1)
+    application.add_handler(CommandHandler("show_task4u", show_task4u_settings), group=-1)
 
     # ── Delete all numbers by mode (slash commands) ──────────────────
-    application.add_handler(CommandHandler("delnums_manual", delnums_manual))
-    application.add_handler(CommandHandler("delnums_hourly", delnums_hourly))
-    application.add_handler(CommandHandler("delnums_wacash", delnums_wacash))
-    application.add_handler(CommandHandler("delnums_auto",   delnums_auto))
+    application.add_handler(CommandHandler("delnums_manual", delnums_manual), group=-1)
+    application.add_handler(CommandHandler("delnums_hourly", delnums_hourly), group=-1)
+    application.add_handler(CommandHandler("delnums_wacash", delnums_wacash), group=-1)
+    application.add_handler(CommandHandler("delnums_auto", delnums_auto), group=-1)
 
     # Initialize database and start background tasks
     init_db()
@@ -6741,14 +6741,30 @@ def main():
 
     # ============ ADD GLOBAL ERROR HANDLER ============
     async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-        """Global error handler to prevent crashes from conflicts"""
+        """Global error handler — logs full traceback, never crashes the bot."""
+        import traceback
         error = context.error
         error_str = str(error)
+        tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+
         if "Conflict" in error_str or "409" in error_str:
             log.warning("⚠️ Bot conflict detected - another instance may be running. Continuing...")
-            # Don't crash, just log and continue
+        elif "Message is not modified" in error_str:
+            pass  # harmless — spinner tried to edit with identical text
+        elif "Message to edit not found" in error_str:
+            pass  # harmless — message was deleted before edit
         else:
-            log.error(f"Unhandled error: {error}")
+            # Log the full traceback so we can actually debug it
+            log.error(f"Unhandled error: {type(error).__name__}: {error}\n{tb}")
+            # Notify user something went wrong if we have a chat context
+            try:
+                if update and hasattr(update, "effective_chat") and update.effective_chat:
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text="⚠️ Something went wrong. Please try again."
+                    )
+            except Exception:
+                pass
     
     application.add_error_handler(global_error_handler)
     # =================================================
