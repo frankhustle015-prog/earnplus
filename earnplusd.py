@@ -4377,56 +4377,110 @@ async def number_action_callback(update: Update, context: ContextTypes.DEFAULT_T
         threading.Thread(target=_pair_bg, args=(uid, account), daemon=True).start()
 
 
-async def delete_all_numbers_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Delete ALL numbers belonging to the user in a specific mode."""
-    query = update.callback_query
-    await query.answer()
-    data  = query.data   # deleteall_hourly | deleteall_manual | deleteall_wacash | deleteall_auto
-    telegram_id = update.effective_user.id
-    uid = get_internal_user_id(telegram_id)
-    if not uid:
-        await query.edit_message_text("Please use /start to register before proceeding.")
-        return
-
-    mode = data.replace("deleteall_", "")  # hourly / manual / wacash / auto
-
-    with get_db() as db:
-        if mode == "hourly" or mode == "manual":
-            count = db.execute("SELECT COUNT(*) FROM numbers WHERE user_id=?", (uid,)).fetchone()[0]
-            db.execute("DELETE FROM numbers WHERE user_id=?", (uid,))
-        elif mode == "wacash":
-            count = db.execute("SELECT COUNT(*) FROM wacash_numbers WHERE user_id=?", (uid,)).fetchone()[0]
-            # Cancel any active wacash pairs first
-            with _wacash_pairs_lock:
-                for account in list(_wacash_pairs.keys()):
-                    if _wacash_pairs[account].get("user_id") == uid:
-                        _wacash_pairs[account]["cancelled"] = True
-            db.execute("DELETE FROM wacash_numbers WHERE user_id=?", (uid,))
-        elif mode == "auto":
-            count = db.execute("SELECT COUNT(*) FROM auto_numbers WHERE user_id=?", (uid,)).fetchone()[0]
-            db.execute("DELETE FROM auto_numbers WHERE user_id=?", (uid,))
-            db.execute("DELETE FROM pending_tasks WHERE user_id=?", (uid,))
-        else:
-            await query.edit_message_text("Unknown mode.")
-            return
-
-    # Also cancel any active manual pairs
-    if mode in ("manual", "hourly"):
-        with pairs_lock:
-            for account in list(active_pairs.keys()):
-                if active_pairs[account].get("user_id") == uid:
-                    active_pairs[account]["cancelled"] = True
-
+# ── Shared delete helper (used by both inline button and slash commands) ────────
+async def _do_delete_all(uid: int, mode: str) -> tuple[int, str]:
+    """
+    Delete all numbers for uid in the given mode.
+    Returns (count_deleted, mode_label).
+    mode: "manual" | "hourly" | "wacash" | "auto"
+    """
     mode_labels = {
         "hourly": "⚡ Hourly",
         "manual": "🔧 Manual",
         "wacash": "📲 Wacash",
         "auto":   "🤖 Auto",
     }
-    label = mode_labels.get(mode, mode.upper())
+    with get_db() as db:
+        if mode in ("hourly", "manual"):
+            count = db.execute("SELECT COUNT(*) FROM numbers WHERE user_id=?", (uid,)).fetchone()[0]
+            db.execute("DELETE FROM numbers WHERE user_id=?", (uid,))
+            # Cancel active manual/hourly pairs
+            with pairs_lock:
+                for acct in list(active_pairs.keys()):
+                    if active_pairs[acct].get("user_id") == uid:
+                        active_pairs[acct]["cancelled"] = True
+        elif mode == "wacash":
+            count = db.execute("SELECT COUNT(*) FROM wacash_numbers WHERE user_id=?", (uid,)).fetchone()[0]
+            with _wacash_pairs_lock:
+                for acct in list(_wacash_pairs.keys()):
+                    if _wacash_pairs[acct].get("user_id") == uid:
+                        _wacash_pairs[acct]["cancelled"] = True
+            db.execute("DELETE FROM wacash_numbers WHERE user_id=?", (uid,))
+        elif mode == "auto":
+            count = db.execute("SELECT COUNT(*) FROM auto_numbers WHERE user_id=?", (uid,)).fetchone()[0]
+            db.execute("DELETE FROM auto_numbers WHERE user_id=?", (uid,))
+            db.execute("DELETE FROM pending_tasks WHERE user_id=?", (uid,))
+        else:
+            return 0, mode.upper()
+    return count, mode_labels.get(mode, mode.upper())
+
+
+# ── Inline button handler ────────────────────────────────────────────────────
+async def delete_all_numbers_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the 🗑 Delete All button in My Numbers."""
+    query = update.callback_query
+    await query.answer()
+    telegram_id = update.effective_user.id
+    uid = get_internal_user_id(telegram_id)
+    if not uid:
+        await query.edit_message_text("Please use /start to register before proceeding.")
+        return
+
+    mode = query.data.replace("deleteall_", "")
+    count, label = await _do_delete_all(uid, mode)
     await query.edit_message_text(
         f"🗑 *All {count} number(s) in {label} mode have been deleted.*\n\n"
         "Use *➕ Add Number* to start fresh.",
+        parse_mode="Markdown"
+    )
+
+
+# ── Slash commands — one per mode ────────────────────────────────────────────
+async def delnums_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/delnums_manual — delete all Manual mode numbers"""
+    uid = get_internal_user_id(update.effective_user.id)
+    if not uid:
+        await update.message.reply_text("Please use /start first.")
+        return
+    count, label = await _do_delete_all(uid, "manual")
+    await update.message.reply_text(
+        f"🗑 *{label} Mode:* {count} number(s) deleted.\n\nUse *➕ Add Number* to start fresh.",
+        parse_mode="Markdown"
+    )
+
+async def delnums_hourly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/delnums_hourly — delete all Hourly mode numbers"""
+    uid = get_internal_user_id(update.effective_user.id)
+    if not uid:
+        await update.message.reply_text("Please use /start first.")
+        return
+    count, label = await _do_delete_all(uid, "hourly")
+    await update.message.reply_text(
+        f"🗑 *{label} Mode:* {count} number(s) deleted.\n\nUse *➕ Add Number* to start fresh.",
+        parse_mode="Markdown"
+    )
+
+async def delnums_wacash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/delnums_wacash — delete all Wacash mode numbers"""
+    uid = get_internal_user_id(update.effective_user.id)
+    if not uid:
+        await update.message.reply_text("Please use /start first.")
+        return
+    count, label = await _do_delete_all(uid, "wacash")
+    await update.message.reply_text(
+        f"🗑 *{label} Mode:* {count} number(s) deleted.\n\nUse *➕ Add Number* to start fresh.",
+        parse_mode="Markdown"
+    )
+
+async def delnums_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/delnums_auto — delete all Auto mode numbers"""
+    uid = get_internal_user_id(update.effective_user.id)
+    if not uid:
+        await update.message.reply_text("Please use /start first.")
+        return
+    count, label = await _do_delete_all(uid, "auto")
+    await update.message.reply_text(
+        f"🗑 *{label} Mode:* {count} number(s) deleted.\n\nUse *➕ Add Number* to start fresh.",
         parse_mode="Markdown"
     )
 
@@ -6667,6 +6721,12 @@ def main():
     application.add_handler(CommandHandler("task4u_creds", task4u_creds_command))
     application.add_handler(CommandHandler("reset_task4u", reset_task4u))
     application.add_handler(CommandHandler("show_task4u", show_task4u_settings))
+
+    # ── Delete all numbers by mode (slash commands) ──────────────────
+    application.add_handler(CommandHandler("delnums_manual", delnums_manual))
+    application.add_handler(CommandHandler("delnums_hourly", delnums_hourly))
+    application.add_handler(CommandHandler("delnums_wacash", delnums_wacash))
+    application.add_handler(CommandHandler("delnums_auto",   delnums_auto))
 
     # Initialize database and start background tasks
     init_db()
