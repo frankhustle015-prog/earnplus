@@ -4392,7 +4392,7 @@ async def _do_delete_all(uid: int, mode: str) -> tuple[int, str]:
     }
     with get_db() as db:
         if mode in ("hourly", "manual"):
-            count = db.execute("SELECT COUNT(*) FROM numbers WHERE user_id=?", (uid,)).fetchone()[0]
+            count = db.execute("SELECT COUNT(*) AS c FROM numbers WHERE user_id=?", (uid,)).fetchone()["c"]
             db.execute("DELETE FROM numbers WHERE user_id=?", (uid,))
             # Cancel active manual/hourly pairs
             with pairs_lock:
@@ -4400,14 +4400,14 @@ async def _do_delete_all(uid: int, mode: str) -> tuple[int, str]:
                     if active_pairs[acct].get("user_id") == uid:
                         active_pairs[acct]["cancelled"] = True
         elif mode == "wacash":
-            count = db.execute("SELECT COUNT(*) FROM wacash_numbers WHERE user_id=?", (uid,)).fetchone()[0]
+            count = db.execute("SELECT COUNT(*) AS c FROM wacash_numbers WHERE user_id=?", (uid,)).fetchone()["c"]
             with _wacash_pairs_lock:
                 for acct in list(_wacash_pairs.keys()):
                     if _wacash_pairs[acct].get("user_id") == uid:
                         _wacash_pairs[acct]["cancelled"] = True
             db.execute("DELETE FROM wacash_numbers WHERE user_id=?", (uid,))
         elif mode == "auto":
-            count = db.execute("SELECT COUNT(*) FROM auto_numbers WHERE user_id=?", (uid,)).fetchone()[0]
+            count = db.execute("SELECT COUNT(*) AS c FROM auto_numbers WHERE user_id=?", (uid,)).fetchone()["c"]
             db.execute("DELETE FROM auto_numbers WHERE user_id=?", (uid,))
             db.execute("DELETE FROM pending_tasks WHERE user_id=?", (uid,))
         else:
@@ -5706,24 +5706,24 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         with get_db() as db:
             # Total hourly earnings
             total_points = db.execute(
-                "SELECT COALESCE(SUM(amount),0) FROM transactions WHERE type='earn' AND description LIKE 'Hourly earning%'"
-            ).fetchone()[0]
+                "SELECT COALESCE(SUM(amount),0) AS c FROM transactions WHERE type='earn' AND description LIKE 'Hourly earning%'"
+            ).fetchone()["c"]
             total_ngn = pts_to_ngn(total_points)
             
             # Active hourly users
             hourly_users = db.execute(
-                "SELECT COUNT(*) FROM users WHERE earning_mode = 'hourly'"
-            ).fetchone()[0]
+                "SELECT COUNT(*) AS c FROM users WHERE earning_mode = 'hourly'"
+            ).fetchone()["c"]
             
             # Online numbers (hourly mode)
             online_numbers = db.execute(
-                "SELECT COUNT(*) FROM numbers WHERE hourly_status = 'online'"
-            ).fetchone()[0]
+                "SELECT COUNT(*) AS c FROM numbers WHERE hourly_status = 'online'"
+            ).fetchone()["c"]
             
             # Total numbers in hourly mode
             total_hourly_numbers = db.execute(
-                "SELECT COUNT(*) FROM numbers n JOIN users u ON n.user_id = u.id WHERE u.earning_mode = 'hourly'"
-            ).fetchone()[0]
+                "SELECT COUNT(*) AS c FROM numbers n JOIN users u ON n.user_id = u.id WHERE u.earning_mode = 'hourly'"
+            ).fetchone()["c"]
             
             rate = get_setting("hourly_rate_ngn", "5.0")
             
