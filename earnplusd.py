@@ -674,6 +674,13 @@ def init_db():
                 db.execute("ALTER TABLE numbers ADD COLUMN offline_hours_processed INTEGER DEFAULT 0")
             except Exception as e:
                 log.info(f"Column offline_hours_processed may already exist: {e}")
+                # Rollback to clear the failed transaction state in PostgreSQL
+                if DATABASE_URL:
+                    try:
+                        conn = db._conn
+                        conn.rollback()
+                    except:
+                        pass
             
             db.execute("""
                 CREATE TABLE IF NOT EXISTS auto_numbers(
