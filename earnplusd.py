@@ -5873,9 +5873,9 @@ async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """, (uid,)).fetchall()
 
         if not numbers:
-            text = f"👤 *{username}* (ID: {uid})\n📭 No numbers linked.\n"
+            text = f"👤 {username} (ID: {uid})\n📭 No numbers linked.\n"
         else:
-            text = f"👤 *{username}* (ID: {uid})\n"
+            text = f"👤 {username} (ID: {uid})\n"
             text += "━━━━━━━━━━━━━━━━━━━━\n"
             
             for n in numbers:
@@ -5905,16 +5905,16 @@ async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     emoji = "🔴"
                     status_line = "OFFLINE"
                     if processed:
-                        status_line += " (✅ cleared/paid)"
+                        status_line += " (cleared/paid)"
                     else:
-                        status_line += " (⚠️ unpaid)"
+                        status_line += " (unpaid)"
 
-                text += f"{emoji} `{account}`\n"
+                text += f"{emoji} {account}\n"
                 text += f"   └ {status_line}\n"
                 text += f"   └ Total hours earned: {total_hours} h\n"
                 
                 if not processed and hourly_status == "offline":
-                    text += f"   └ 🔘 *Unpaid* – Use /clear_offline {uid} {account} to mark paid\n"
+                    text += f"   └ Unpaid – Use /clear_offline {uid} {account} to mark paid\n"
                 text += "\n"
 
         # Split if message too long
@@ -5927,7 +5927,8 @@ async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_back")]
         ])
         
-        await query.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        # FIXED: Use parse_mode=None to avoid markdown errors
+        await query.message.reply_text(text, parse_mode=None, reply_markup=keyboard)
         
 async def clear_offline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/clear_offline <user_id> [account] - mark offline number(s) as paid"""
