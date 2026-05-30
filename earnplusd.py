@@ -5822,16 +5822,36 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     elif data.startswith("clear_user_"):
         uid = int(data.split("_")[2])
         with get_db() as db:
-            # Mark all offline numbers for this user as cleared/paid
+            # Get count and total hours before deleting
+            result = db.execute("""
+                SELECT 
+                    COUNT(*) as c, 
+                    COALESCE(SUM(total_hours_earned), 0) as total_hours
+                FROM numbers 
+                WHERE user_id = ? AND hourly_status = 'offline' AND offline_hours_processed = 0
+            """, (uid,)).fetchone()
+            count = result["c"] if result else 0
+            total_hours = result["total_hours"] if result else 0
+            
+            # DELETE the offline numbers (they've been paid)
             db.execute("""
-                UPDATE numbers
-                SET offline_hours_processed = 1
-                WHERE user_id = ? AND hourly_status = 'offline'
+                DELETE FROM numbers
+                WHERE user_id = ? AND hourly_status = 'offline' AND offline_hours_processed = 0
             """, (uid,))
-            # Log the action
+            
+            # Log the action with hours info
             _admin_log(db, get_internal_user_id(ADMIN_TELEGRAM_ID), "clear_offline",
-                       f"user_id={uid}", "All offline numbers marked as paid")
-        await query.edit_message_text(f"✅ All offline numbers for user {uid} have been marked as cleared (paid).")
+                       f"user_id={uid}", f"Deleted {count} offline numbers with {total_hours} total hours")
+        
+        rate_ngn = float(get_setting("hourly_rate_ngn", "5.0"))
+        total_ngn = total_hours * rate_ngn
+        
+        await query.edit_message_text(
+            f"✅ Cleared {count} offline number(s) for user {uid}.\n"
+            f"   Total hours: {total_hours} h\n"
+            f"   Total value: ₦{total_ngn:.2f}\n\n"
+            f"These numbers have been removed from the system."
+        )
         await asyncio.sleep(1)
         await show_user_numbers(update, context)
 
@@ -5876,18 +5896,24 @@ async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = u["id"]
         username = u["username"] or f"User_{uid}"
         
-        # First, sync online status from API
+        # Get numbers - ONLY show UNPAID offline numbers (processed=0) and online numbers
         with get_db() as db:
             numbers = db.execute("""
                 SELECT account, status, hourly_status, total_hours_earned,
                        hourly_start_time, offline_hours_processed,
                        platform_hours_at_start, id
                 FROM numbers
-                WHERE user_id = ?
-                ORDER BY added_at DESC
+                WHERE user_id = ? 
+                  AND (hourly_status = 'online' OR offline_hours_processed = 0)
+                ORDER BY 
+                    CASE WHEN hourly_status = 'online' THEN 1 ELSE 2 END,
+                    added_at DESC
             """, (uid,)).fetchall()
         
-        # Update online status based on API
+        # Update online status based on API and collect stats
+        total_offline_hours = 0
+        offline_count = 0
+        
         for n in numbers:
             account = n["account"]
             is_online_api = account in online_set
@@ -5899,7 +5925,8 @@ async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     db2.execute("""
                         UPDATE numbers 
                         SET hourly_status = 'online',
-                            hourly_start_time = CURRENT_TIMESTAMP
+                            hourly_start_time = CURRENT_TIMESTAMP,
+                            offline_hours_processed = 0
                         WHERE id = ?
                     """, (n["id"],))
                 log.info(f"[Admin] Fixed sync: {account} is online but DB said {current_db_status}")
@@ -5913,6 +5940,12 @@ async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         WHERE id = ?
                     """, (n["id"],))
                 log.info(f"[Admin] Fixed sync: {account} is offline but DB said online")
+            
+            # Collect offline hours for summary
+            if current_db_status == "offline" and n["offline_hours_processed"] == 0:
+                offline_count += 1
+                # Add the total hours this number earned while online
+                total_offline_hours += (n["total_hours_earned"] or 0)
         
         # Refresh numbers after sync
         with get_db() as db:
@@ -5921,12 +5954,15 @@ async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                        hourly_start_time, offline_hours_processed,
                        platform_hours_at_start, id
                 FROM numbers
-                WHERE user_id = ?
-                ORDER BY added_at DESC
+                WHERE user_id = ? 
+                  AND (hourly_status = 'online' OR offline_hours_processed = 0)
+                ORDER BY 
+                    CASE WHEN hourly_status = 'online' THEN 1 ELSE 2 END,
+                    added_at DESC
             """, (uid,)).fetchall()
 
         if not numbers:
-            text = f"👤 {username} (ID: {uid})\n📭 No numbers linked.\n"
+            text = f"👤 {username} (ID: {uid})\n📭 No unpaid offline or online numbers.\n"
         else:
             text = f"👤 {username} (ID: {uid})\n"
             text += "━━━━━━━━━━━━━━━━━━━━\n"
@@ -5964,20 +6000,25 @@ async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         status_line += f" · +{current_hours}h this session"
                 else:
                     emoji = "🔴"
-                    status_line = "OFFLINE"
-                    if processed == 1:
-                        status_line += " ✅ (PAID - cleared)"
-                    else:
-                        status_line += " ⚠️ (UNPAID - not cleared)"
-
+                    status_line = "OFFLINE (UNPAID)"
+                
                 text += f"{emoji} {account}\n"
                 text += f"   └ {status_line}\n"
                 text += f"   └ Total hours earned: {total_hours} h\n"
-                text += f"   └ cleared flag: {processed}\n"
                 
-                if processed == 0 and not is_online_api:
+                if not is_online_api:
                     text += f"   └ 🔘 Use /clear_offline {uid} {account} to mark paid\n"
                 text += "\n"
+            
+            # Add summary section
+            if offline_count > 0:
+                text += "━━━━━━━━━━━━━━━━━━━━\n"
+                text += f"📊 *Offline Summary for {username}*\n"
+                text += f"   📞 Unpaid offline numbers: {offline_count}\n"
+                text += f"   ⏱ Total hours from offline numbers: {total_offline_hours} h\n"
+                rate_ngn = float(get_setting("hourly_rate_ngn", "5.0"))
+                total_ngn = total_offline_hours * rate_ngn
+                text += f"   💰 Total value: ₦{total_ngn:.2f}\n"
 
         # Split if message too long
         if len(text) > 4000:
@@ -5990,7 +6031,6 @@ async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_back")]
         ])
         
-        # FIXED: Use parse_mode=None to avoid markdown errors
         await query.message.reply_text(text, parse_mode=None, reply_markup=keyboard)
         
 async def clear_offline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
