@@ -669,6 +669,12 @@ def init_db():
                 )
             """)
             
+            # Add offline_hours_processed column for existing tables (if upgrading)
+            try:
+                db.execute("ALTER TABLE numbers ADD COLUMN offline_hours_processed INTEGER DEFAULT 0")
+            except Exception as e:
+                log.info(f"Column offline_hours_processed may already exist: {e}")
+            
             db.execute("""
                 CREATE TABLE IF NOT EXISTS auto_numbers(
                     id SERIAL PRIMARY KEY,
