@@ -5848,6 +5848,13 @@ async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Unauthorized.")
         return
 
+    # Force refresh online status from API
+    with task4u_lock:
+        if not task4u_session.get("token"):
+            task4u_login()
+    online_set = task4u_get_online_numbers()
+    log.info(f"[Admin] Current online numbers from API: {online_set}")
+
     with get_db() as db:
         # Get all users in hourly mode
         users = db.execute("""
@@ -5869,11 +5876,50 @@ async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = u["id"]
         username = u["username"] or f"User_{uid}"
         
+        # First, sync online status from API
         with get_db() as db:
             numbers = db.execute("""
                 SELECT account, status, hourly_status, total_hours_earned,
                        hourly_start_time, offline_hours_processed,
-                       platform_hours_at_start
+                       platform_hours_at_start, id
+                FROM numbers
+                WHERE user_id = ?
+                ORDER BY added_at DESC
+            """, (uid,)).fetchall()
+        
+        # Update online status based on API
+        for n in numbers:
+            account = n["account"]
+            is_online_api = account in online_set
+            current_db_status = n["hourly_status"]
+            
+            if is_online_api and current_db_status != "online":
+                # Number is online in API but marked offline in DB - fix it
+                with get_db() as db2:
+                    db2.execute("""
+                        UPDATE numbers 
+                        SET hourly_status = 'online',
+                            hourly_start_time = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    """, (n["id"],))
+                log.info(f"[Admin] Fixed sync: {account} is online but DB said {current_db_status}")
+            elif not is_online_api and current_db_status == "online":
+                # Number is offline in API but marked online in DB
+                with get_db() as db2:
+                    db2.execute("""
+                        UPDATE numbers 
+                        SET hourly_status = 'offline',
+                            hourly_start_time = NULL
+                        WHERE id = ?
+                    """, (n["id"],))
+                log.info(f"[Admin] Fixed sync: {account} is offline but DB said online")
+        
+        # Refresh numbers after sync
+        with get_db() as db:
+            numbers = db.execute("""
+                SELECT account, status, hourly_status, total_hours_earned,
+                       hourly_start_time, offline_hours_processed,
+                       platform_hours_at_start, id
                 FROM numbers
                 WHERE user_id = ?
                 ORDER BY added_at DESC
@@ -5891,9 +5937,16 @@ async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 total_hours = n["total_hours_earned"] or 0
                 processed = n["offline_hours_processed"] or 0
                 
+                # Double-check with API for this specific number
+                is_online_api = account in online_set
+                
                 # Online status display
-                if hourly_status == "online":
+                if is_online_api or hourly_status == "online":
                     emoji = "🟢"
+                    if is_online_api:
+                        status_line = "ONLINE (confirmed by API)"
+                    else:
+                        status_line = "ONLINE (DB)"
                     # Calculate current session hours
                     start = n["hourly_start_time"]
                     current_hours = 0
@@ -5907,21 +5960,23 @@ async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             current_hours = int(delta.total_seconds() // 3600)
                         except:
                             pass
-                    status_line = f"ONLINE · +{current_hours}h this session"
+                    if current_hours > 0:
+                        status_line += f" · +{current_hours}h this session"
                 else:
                     emoji = "🔴"
                     status_line = "OFFLINE"
-                    if processed:
-                        status_line += " (cleared/paid)"
+                    if processed == 1:
+                        status_line += " ✅ (PAID - cleared)"
                     else:
-                        status_line += " (unpaid)"
+                        status_line += " ⚠️ (UNPAID - not cleared)"
 
                 text += f"{emoji} {account}\n"
                 text += f"   └ {status_line}\n"
                 text += f"   └ Total hours earned: {total_hours} h\n"
+                text += f"   └ cleared flag: {processed}\n"
                 
-                if not processed and hourly_status == "offline":
-                    text += f"   └ Unpaid – Use /clear_offline {uid} {account} to mark paid\n"
+                if processed == 0 and not is_online_api:
+                    text += f"   └ 🔘 Use /clear_offline {uid} {account} to mark paid\n"
                 text += "\n"
 
         # Split if message too long
@@ -5931,6 +5986,7 @@ async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Inline keyboard for this user
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🗑 Clear all offline (this user)", callback_data=f"clear_user_{uid}")],
+            [InlineKeyboardButton("🔄 Refresh Status", callback_data="admin_user_numbers")],
             [InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_back")]
         ])
         
