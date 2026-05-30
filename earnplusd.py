@@ -61,7 +61,8 @@ from telegram.ext import (
 # Global variables for bot
 _application = None
 _bot_loop = None  # ADD THIS LINE RIGHT HERE
-
+_offline_pending = {}
+_OFFLINE_CONFIRM_SEC = 120
 # ----------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------
@@ -663,6 +664,7 @@ def init_db():
                     last_hourly_payout_time TIMESTAMP,
                     platform_hours_at_start INTEGER DEFAULT 0,
                     total_hours_earned INTEGER DEFAULT 0,
+                    offline_hours_processed INTEGER DEFAULT 0,
                     UNIQUE(user_id, account)
                 )
             """)
@@ -997,6 +999,9 @@ def init_db():
             except Exception: pass
             try:
                 db.execute("ALTER TABLE numbers ADD COLUMN total_hours_earned INTEGER DEFAULT 0")
+            except Exception: pass
+            try:
+                db.execute("ALTER TABLE numbers ADD COLUMN offline_hours_processed INTEGER DEFAULT 0")
             except Exception: pass
             
             try:
@@ -2755,25 +2760,43 @@ async def handle_number_came_online(row):
 
 
 async def handle_number_went_offline(row):
-    """Mark number offline (using Task4U API), notify user."""
+    """Mark number offline, but only if it stays offline for _OFFLINE_CONFIRM_SEC."""
+    account = row["account"]
+    now = time.time()
+    if account in _offline_pending:
+        if now - _offline_pending[account] >= _OFFLINE_CONFIRM_SEC:
+            online_set = task4u_get_online_numbers()
+            if account not in online_set:
+                await _do_offline_mark(row)
+            _offline_pending.pop(account, None)
+        return
+    else:
+        _offline_pending[account] = now
+        await asyncio.sleep(_OFFLINE_CONFIRM_SEC)
+        online_set = task4u_get_online_numbers()
+        if account not in online_set:
+            await _do_offline_mark(row)
+        _offline_pending.pop(account, None)
+        
+async def _do_offline_mark(row):
+    """Actually mark number offline and set processed flag to false."""
     user_id = row["user_id"]
     account = row["account"]
     telegram_id = row["telegram_id"]
-
     with get_db() as db:
         db.execute("""
             UPDATE numbers
             SET hourly_status = 'offline',
                 hourly_start_time = NULL,
-                platform_hours_at_start = 0
+                platform_hours_at_start = 0,
+                offline_hours_processed = 0
             WHERE id = ?
         """, (row["id"],))
-
     await send_telegram(
         telegram_id,
         f"⚠️ NUMBER OFFLINE ⚠️\n\n"
         f"📱 {account}\n"
-        f"⏱ Was online until now.\n\n"
+        f"⏱ Went offline at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC.\n\n"
         f"➡️ Click Reauthorize to reconnect and resume earning!"
     )
 
@@ -2977,6 +3000,7 @@ admin_extra_keyboard = ReplyKeyboardMarkup([
 # Admin panel keyboard with colored inline buttons
 admin_panel_buttons = [
     [InlineKeyboardButton("📊 Stats", callback_data="admin_stats", style="primary")],
+    [InlineKeyboardButton("📊 User Numbers", callback_data="admin_user_numbers", style="primary")],
     [InlineKeyboardButton("👥 Users List", callback_data="admin_users", style="primary")],
     [InlineKeyboardButton("✅ Approve Withdrawals", callback_data="admin_withdrawals", style="success")],
     [InlineKeyboardButton("📜 All Withdrawals", callback_data="admin_all_withdrawals", style="primary")],
@@ -5328,6 +5352,9 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_panel_markup)
 
+    elif data == "admin_user_numbers":
+        await show_user_numbers(update, context)
+
     elif data == "admin_users":
         with get_db() as db:
             rows = db.execute("SELECT id, username, telegram_id, balance, is_banned, created_at FROM users ORDER BY created_at DESC LIMIT 20").fetchall()
@@ -5357,7 +5384,6 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         
         for w in wds:
-            # Handle datetime object correctly
             created_at = w["created_at"]
             if hasattr(created_at, 'strftime'):
                 created_str = created_at.strftime("%Y-%m-%d %H:%M")
@@ -5368,7 +5394,6 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             text += f"   📅 {created_str}\n"
             text += f"   💰 ₦{w['amount']:.2f} | {w['method'].upper()}\n"
             
-            # Show bank details if bank transfer
             if w["method"] == "bank":
                 text += f"   🏦 Bank: {w['bank_name'] or 'N/A'}\n"
                 text += f"   🔢 Account: {w['account_num'] or 'N/A'}\n"
@@ -5387,7 +5412,6 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         
     elif data == "admin_all_withdrawals":
         with get_db() as db:
-            # Get all withdrawals with user info and bank details
             if DATABASE_URL:
                 withdrawals = db.execute("""
                     SELECT w.*, u.username, u.telegram_id,
@@ -5413,7 +5437,6 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.edit_message_text("No withdrawals found.", reply_markup=admin_panel_markup)
             return
         
-        # Build message
         text = "📜 *ALL WITHDRAWALS (Last 100)*\n"
         text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         
@@ -5428,7 +5451,6 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             amount = float(w["amount"] or 0)
             username = w["username"][:15] if w["username"] else "Unknown"
             
-            # Handle datetime object correctly
             created_at = w["created_at"]
             if hasattr(created_at, 'strftime'):
                 created_str = created_at.strftime("%Y-%m-%d %H:%M")
@@ -5454,7 +5476,6 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             text += f"   💰 {pts:,} pts (≈ ₦{amount:.2f})\n"
             text += f"   📊 {status_text}\n"
             
-            # Show bank details if available
             if w["method"] == "bank" or w.get("bank_name"):
                 text += f"   🏦 Bank: {w.get('bank_name') or 'N/A'}\n"
                 text += f"   🔢 Account: {w.get('account_num') or 'N/A'}\n"
@@ -5591,7 +5612,6 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         new_mode = data.split("_")[1]
         log.info(f"🔁 Switching to mode: {new_mode}")
         
-        # If switching to wacash, verify credentials exist
         if new_mode == "wacash":
             acct = get_setting("wacash_account", "")
             pwd = get_setting("wacash_password", "")
@@ -5604,22 +5624,17 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
                 return
         
-        # Direct database update to ensure it works
         with get_db() as db:
             if DATABASE_URL:
-                # PostgreSQL syntax with ON CONFLICT
                 db.execute(
                     "INSERT INTO settings(key, value) VALUES(%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
                     ('earning_mode', new_mode)
                 )
             else:
-                # SQLite syntax
                 db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", ('earning_mode', new_mode))
         
-        # Also update via set_setting for cache
         set_setting("earning_mode", new_mode)
         
-        # Verify the update worked
         with get_db() as db:
             if DATABASE_URL:
                 verify = db.execute("SELECT value FROM settings WHERE key=%s", ('earning_mode',)).fetchone()
@@ -5627,13 +5642,11 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 verify = db.execute("SELECT value FROM settings WHERE key=?", ('earning_mode',)).fetchone()
             log.info(f"Verified mode in DB: {verify['value'] if verify else 'NOT FOUND'}")
         
-        # Post-switch side effects
         if new_mode == "wacash":
             threading.Thread(target=wacash_login, daemon=True).start()
         elif new_mode == "auto" and _worker_client is None:
             asyncio.create_task(_start_task_worker())
 
-        # Verify the switch actually took effect by reading back from DB
         confirmed = get_earning_mode()
         mode_notes = {
             "manual": "Users must tap Send All to fire messages manually.",
@@ -5671,7 +5684,6 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     elif data == "admin_broadcast":
         await query.edit_message_text("Send the broadcast message as a reply to this command:\nUse /broadcast Your message here")
 
-    # ========== HOURLY ADMIN CONTROLS ==========
     elif data == "admin_hourly_rate":
         current_rate = get_setting("hourly_rate_ngn", "5.0")
         await query.edit_message_text(
@@ -5704,23 +5716,19 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     elif data == "admin_hourly_stats":
         with get_db() as db:
-            # Total hourly earnings
             total_points = db.execute(
                 "SELECT COALESCE(SUM(amount),0) AS c FROM transactions WHERE type='earn' AND description LIKE 'Hourly earning%'"
             ).fetchone()["c"]
             total_ngn = pts_to_ngn(total_points)
             
-            # Active hourly users
             hourly_users = db.execute(
                 "SELECT COUNT(*) AS c FROM users WHERE earning_mode = 'hourly'"
             ).fetchone()["c"]
             
-            # Online numbers (hourly mode)
             online_numbers = db.execute(
                 "SELECT COUNT(*) AS c FROM numbers WHERE hourly_status = 'online'"
             ).fetchone()["c"]
             
-            # Total numbers in hourly mode
             total_hourly_numbers = db.execute(
                 "SELECT COUNT(*) AS c FROM numbers n JOIN users u ON n.user_id = u.id WHERE u.earning_mode = 'hourly'"
             ).fetchone()["c"]
@@ -5764,7 +5772,6 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             "Triggering immediate hourly payout check for all online numbers...",
             parse_mode="Markdown"
         )
-        # Run payout check in background
         asyncio.create_task(force_hourly_payout())
         await asyncio.sleep(2)
         await query.message.reply_text("✅ Hourly payout check triggered successfully!")
@@ -5799,9 +5806,174 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             text += f"`{l['created_at'][:16]}` {l['admin_name']}: {l['action']} {l.get('target','')}\n"
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_panel_markup)
 
+    elif data.startswith("clear_user_"):
+        uid = int(data.split("_")[2])
+        with get_db() as db:
+            # Mark all offline numbers for this user as cleared/paid
+            db.execute("""
+                UPDATE numbers
+                SET offline_hours_processed = 1
+                WHERE user_id = ? AND hourly_status = 'offline'
+            """, (uid,))
+            # Log the action
+            _admin_log(db, get_internal_user_id(ADMIN_TELEGRAM_ID), "clear_offline",
+                       f"user_id={uid}", "All offline numbers marked as paid")
+        await query.edit_message_text(f"✅ All offline numbers for user {uid} have been marked as cleared (paid).")
+        await asyncio.sleep(1)
+        await show_user_numbers(update, context)
+
     elif data == "admin_back":
         await query.edit_message_text("Switching back to user menu...")
         await update.effective_chat.send_message("Main menu:", reply_markup=main_keyboard)
+        
+async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show all users and their numbers with online/offline status and hours."""
+    query = update.callback_query
+    telegram_id = update.effective_user.id
+    
+    if telegram_id != ADMIN_TELEGRAM_ID:
+        await query.edit_message_text("Unauthorized.")
+        return
+
+    with get_db() as db:
+        # Get all users in hourly mode
+        users = db.execute("""
+            SELECT id, username, telegram_id 
+            FROM users 
+            WHERE earning_mode = 'hourly' 
+            ORDER BY id
+        """).fetchall()
+
+    if not users:
+        await query.edit_message_text(
+            "No users in hourly mode.", 
+            reply_markup=admin_panel_markup
+        )
+        return
+
+    # Send one message per user
+    for u in users:
+        uid = u["id"]
+        username = u["username"] or f"User_{uid}"
+        
+        with get_db() as db:
+            numbers = db.execute("""
+                SELECT account, status, hourly_status, total_hours_earned,
+                       hourly_start_time, offline_hours_processed,
+                       platform_hours_at_start
+                FROM numbers
+                WHERE user_id = ?
+                ORDER BY added_at DESC
+            """, (uid,)).fetchall()
+
+        if not numbers:
+            text = f"👤 *{username}* (ID: {uid})\n📭 No numbers linked.\n"
+        else:
+            text = f"👤 *{username}* (ID: {uid})\n"
+            text += "━━━━━━━━━━━━━━━━━━━━\n"
+            
+            for n in numbers:
+                account = n["account"]
+                hourly_status = n["hourly_status"] or "offline"
+                total_hours = n["total_hours_earned"] or 0
+                processed = n["offline_hours_processed"] or 0
+                
+                # Online status display
+                if hourly_status == "online":
+                    emoji = "🟢"
+                    # Calculate current session hours
+                    start = n["hourly_start_time"]
+                    current_hours = 0
+                    if start:
+                        try:
+                            if DATABASE_URL:
+                                start_dt = start
+                            else:
+                                start_dt = datetime.fromisoformat(str(start).replace(' ', 'T'))
+                            delta = datetime.utcnow() - start_dt
+                            current_hours = int(delta.total_seconds() // 3600)
+                        except:
+                            pass
+                    status_line = f"ONLINE · +{current_hours}h this session"
+                else:
+                    emoji = "🔴"
+                    status_line = "OFFLINE"
+                    if processed:
+                        status_line += " (✅ cleared/paid)"
+                    else:
+                        status_line += " (⚠️ unpaid)"
+
+                text += f"{emoji} `{account}`\n"
+                text += f"   └ {status_line}\n"
+                text += f"   └ Total hours earned: {total_hours} h\n"
+                
+                if not processed and hourly_status == "offline":
+                    text += f"   └ 🔘 *Unpaid* – Use /clear_offline {uid} {account} to mark paid\n"
+                text += "\n"
+
+        # Split if message too long
+        if len(text) > 4000:
+            text = text[:3970] + "\n... (truncated)"
+
+        # Inline keyboard for this user
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Clear all offline (this user)", callback_data=f"clear_user_{uid}")],
+            [InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_back")]
+        ])
+        
+        await query.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        
+async def clear_offline_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/clear_offline <user_id> [account] - mark offline number(s) as paid"""
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("Unauthorized.")
+        return
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/clear_offline <user_id> - clear all offline numbers for a user\n"
+            "/clear_offline <user_id> <account> - clear a specific offline number"
+        )
+        return
+    try:
+        uid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid user_id. Must be a number.")
+        return
+    
+    account = args[1] if len(args) > 1 else None
+    
+    with get_db() as db:
+        if account:
+            db.execute("""
+                UPDATE numbers 
+                SET offline_hours_processed = 1 
+                WHERE user_id = ? AND account = ? AND hourly_status = 'offline'
+            """, (uid, account))
+            _admin_log(db, get_internal_user_id(ADMIN_TELEGRAM_ID), "clear_offline",
+                       f"user_id={uid}", f"Number {account} marked as paid")
+            await update.message.reply_text(f"✅ Offline number {account} for user {uid} has been marked as cleared/paid.")
+        else:
+            # Count how many will be cleared
+            result = db.execute("""
+                SELECT COUNT(*) as c FROM numbers 
+                WHERE user_id = ? AND hourly_status = 'offline' AND offline_hours_processed = 0
+            """, (uid,)).fetchone()
+            count = result["c"] if result else 0
+            
+            if count == 0:
+                await update.message.reply_text(f"No unpaid offline numbers found for user {uid}.")
+                return
+            
+            db.execute("""
+                UPDATE numbers 
+                SET offline_hours_processed = 1 
+                WHERE user_id = ? AND hourly_status = 'offline'
+            """, (uid,))
+            _admin_log(db, get_internal_user_id(ADMIN_TELEGRAM_ID), "clear_offline",
+                       f"user_id={uid}", f"Cleared {count} offline numbers")
+            await update.message.reply_text(f"✅ Cleared {count} offline number(s) for user {uid} as paid.")
 
 async def admin_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
@@ -6727,6 +6899,7 @@ def main():
     application.add_handler(CommandHandler("delnums_hourly", delnums_hourly), group=-1)
     application.add_handler(CommandHandler("delnums_wacash", delnums_wacash), group=-1)
     application.add_handler(CommandHandler("delnums_auto", delnums_auto), group=-1)
+    application.add_handler(CommandHandler("clear_offline", clear_offline_command), group=-1)
 
     # Initialize database and start background tasks
     init_db()
