@@ -2061,7 +2061,7 @@ def _pair_hourly_bg(user_id: int, account: str,
                     if not db.execute("SELECT id FROM numbers WHERE user_id=? AND account=?", (user_id, nv)).fetchone():
                         db.execute("INSERT INTO numbers(user_id,account,status,hourly_status) VALUES(?,?,'pairing','pending')", (user_id, nv))
 
-    # All variants tried — still no code
+    # 🔧 FIX #2a: All variants tried — still no code → DELETE all variants
     if not pair_code:
         tried_str = ", ".join(f"`{v}`" for v in variants)
         asyncio.run_coroutine_threadsafe(
@@ -2072,13 +2072,14 @@ def _pair_hourly_bg(user_id: int, account: str,
                 parse_mode="Markdown"),
             _bot_loop
         )
+        # DELETE all variant rows immediately instead of marking them offline
         with get_db() as db:
             is_postgres = DATABASE_URL is not None
             for v in variants:
                 if is_postgres:
-                    db.execute("UPDATE numbers SET status='error', hourly_status='offline' WHERE user_id=%s AND account=%s", (user_id, v))
+                    db.execute("DELETE FROM numbers WHERE user_id=%s AND account=%s", (user_id, v))
                 else:
-                    db.execute("UPDATE numbers SET status='error', hourly_status='offline' WHERE user_id=? AND account=?", (user_id, v))
+                    db.execute("DELETE FROM numbers WHERE user_id=? AND account=?", (user_id, v))
         return
 
     # Store code in DB
@@ -2122,21 +2123,23 @@ def _pair_hourly_bg(user_id: int, account: str,
             break
         time.sleep(4)
 
+    # 🔧 FIX #2b: Timeout — number never came online → DELETE it
     if not came_online:
         asyncio.run_coroutine_threadsafe(
             send_telegram(telegram_id,
                 f"\u23f0 *Pairing Timeout*\n\n"
                 f"\U0001f4f1 `{used_account}` did not come online within 10 minutes.\n\n"
-                "Open *My Numbers* and tap *Reauthorize* to try again.",
+                "Please check the number and try again from *My Numbers*.",
                 parse_mode="Markdown"),
             _bot_loop
         )
+        # DELETE the number (never earned any hours)
         with get_db() as db:
             is_postgres = DATABASE_URL is not None
             if is_postgres:
-                db.execute("UPDATE numbers SET status='timeout', hourly_status='offline', pair_code=NULL WHERE user_id=%s AND account=%s", (user_id, used_account))
+                db.execute("DELETE FROM numbers WHERE user_id=%s AND account=%s", (user_id, used_account))
             else:
-                db.execute("UPDATE numbers SET status='timeout', hourly_status='offline', pair_code=NULL WHERE user_id=? AND account=?", (user_id, used_account))
+                db.execute("DELETE FROM numbers WHERE user_id=? AND account=?", (user_id, used_account))
         return
 
     # Number is online — record baseline
@@ -2792,10 +2795,20 @@ async def handle_number_went_offline(row):
         _offline_pending.pop(account, None)
         
 async def _do_offline_mark(row):
-    """Actually mark number offline and set processed flag to false."""
-    user_id = row["user_id"]
-    account = row["account"]
+    """Mark offline. Auto-deletes if 0h earned (failed pairing variant)."""
+    user_id     = row["user_id"]
+    account     = row["account"]
     telegram_id = row["telegram_id"]
+    total_h     = row.get("total_hours_earned", 0) or 0
+
+    if total_h == 0:
+        # Never earned — it's a failed variant. Delete silently.
+        with get_db() as db:
+            db.execute("DELETE FROM numbers WHERE id = ?", (row["id"],))
+        log.info(f"[Monitor] Auto-deleted 0h offline number {account} uid={user_id}")
+        return
+
+    # Has hours — mark offline so admin can review
     with get_db() as db:
         db.execute("""
             UPDATE numbers
@@ -2805,12 +2818,18 @@ async def _do_offline_mark(row):
                 offline_hours_processed = 0
             WHERE id = ?
         """, (row["id"],))
+
+    rate_ngn = float(get_setting("hourly_rate_ngn", "5.0"))
+    earned   = total_h * rate_ngn
     await send_telegram(
         telegram_id,
-        f"⚠️ NUMBER OFFLINE ⚠️\n\n"
-        f"📱 {account}\n"
-        f"⏱ Went offline at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC.\n\n"
-        f"➡️ Click Reauthorize to reconnect and resume earning!"
+        f"⚠️ *NUMBER OFFLINE*\n\n"
+        f"📱 `{account}`\n"
+        f"⏱ Hours earned: *{total_h}h*\n"
+        f"💰 Value: ₦{earned:.2f}\n\n"
+        f"Admin will process your payment.\n"
+        f"Tap *Reauthorize* to reconnect.",
+        parse_mode="Markdown"
     )
 
 async def realtime_hourly_monitor():
@@ -2830,6 +2849,7 @@ async def realtime_hourly_monitor():
             with get_db() as db:
                 rows = db.execute("""
                     SELECT n.id, n.user_id, n.account, n.hourly_status,
+                           n.total_hours_earned,
                            u.earning_mode, u.telegram_id
                     FROM numbers n
                     JOIN users u ON n.user_id = u.id
@@ -5828,7 +5848,9 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                     COUNT(*) as c, 
                     COALESCE(SUM(total_hours_earned), 0) as total_hours
                 FROM numbers 
-                WHERE user_id = ? AND hourly_status = 'offline' AND offline_hours_processed = 0
+                WHERE user_id = ?
+                  AND hourly_status = 'offline'
+                  AND COALESCE(offline_hours_processed, 0) = 0
             """, (uid,)).fetchone()
             count = result["c"] if result else 0
             total_hours = result["total_hours"] if result else 0
@@ -5836,7 +5858,9 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             # DELETE the offline numbers (they've been paid)
             db.execute("""
                 DELETE FROM numbers
-                WHERE user_id = ? AND hourly_status = 'offline' AND offline_hours_processed = 0
+                WHERE user_id = ?
+                  AND hourly_status = 'offline'
+                  AND COALESCE(offline_hours_processed, 0) = 0
             """, (uid,))
             
             # Log the action with hours info
@@ -5908,10 +5932,17 @@ async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             numbers = db.execute("""
                 SELECT account, status, hourly_status, total_hours_earned,
                        hourly_start_time, offline_hours_processed,
-                       platform_hours_at_start, id
+                       platform_hours_at_start, id, added_at
                 FROM numbers
                 WHERE user_id = ? 
-                  AND (hourly_status = 'online' OR offline_hours_processed = 0)
+                  AND (
+                    hourly_status = 'online'
+                    OR (
+                      hourly_status = 'offline'
+                      AND COALESCE(offline_hours_processed, 0) = 0
+                      AND COALESCE(total_hours_earned, 0) > 0
+                    )
+                  )
                 ORDER BY 
                     CASE WHEN hourly_status = 'online' THEN 1 ELSE 2 END,
                     added_at DESC
@@ -5948,10 +5979,9 @@ async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     """, (n["id"],))
                 log.info(f"[Admin] Fixed sync: {account} is offline but DB said online")
             
-            # Collect offline hours for summary
-            if current_db_status == "offline" and n["offline_hours_processed"] == 0:
+            # Collect offline hours for summary (after sync)
+            if n["hourly_status"] == "offline" and n["offline_hours_processed"] == 0:
                 offline_count += 1
-                # Add the total hours this number earned while online
                 total_offline_hours += (n["total_hours_earned"] or 0)
         
         # Refresh numbers after sync
@@ -5959,10 +5989,17 @@ async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             numbers = db.execute("""
                 SELECT account, status, hourly_status, total_hours_earned,
                        hourly_start_time, offline_hours_processed,
-                       platform_hours_at_start, id
+                       platform_hours_at_start, id, added_at
                 FROM numbers
                 WHERE user_id = ? 
-                  AND (hourly_status = 'online' OR offline_hours_processed = 0)
+                  AND (
+                    hourly_status = 'online'
+                    OR (
+                      hourly_status = 'offline'
+                      AND COALESCE(offline_hours_processed, 0) = 0
+                      AND COALESCE(total_hours_earned, 0) > 0
+                    )
+                  )
                 ORDER BY 
                     CASE WHEN hourly_status = 'online' THEN 1 ELSE 2 END,
                     added_at DESC
@@ -6031,12 +6068,14 @@ async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(text) > 4000:
             text = text[:3970] + "\n... (truncated)"
 
-        # Inline keyboard for this user
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗑 Clear all offline (this user)", callback_data=f"clear_user_{uid}")],
-            [InlineKeyboardButton("🔄 Refresh Status", callback_data="admin_user_numbers")],
-            [InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_back")]
-        ])
+        # 🔧 FIXED: Only show "Clear all offline" button if there are unpaid offline numbers
+        keyboard_buttons = []
+        if offline_count > 0:
+            keyboard_buttons.append([InlineKeyboardButton(f"🗑 Clear {offline_count} offline (this user)", callback_data=f"clear_user_{uid}")])
+        keyboard_buttons.append([InlineKeyboardButton("🔄 Refresh Status", callback_data="admin_user_numbers")])
+        keyboard_buttons.append([InlineKeyboardButton("◀️ Back to Admin Panel", callback_data="admin_back")])
+        
+        keyboard = InlineKeyboardMarkup(keyboard_buttons)
         
         await query.message.reply_text(text, parse_mode=None, reply_markup=keyboard)
         
@@ -6075,7 +6114,10 @@ async def clear_offline_command(update: Update, context: ContextTypes.DEFAULT_TY
             # Count how many will be cleared
             result = db.execute("""
                 SELECT COUNT(*) as c FROM numbers 
-                WHERE user_id = ? AND hourly_status = 'offline' AND offline_hours_processed = 0
+                WHERE user_id = ?
+                AND hourly_status = 'offline'
+                AND COALESCE(offline_hours_processed, 0) = 0
+                AND COALESCE(total_hours_earned, 0) > 0
             """, (uid,)).fetchone()
             count = result["c"] if result else 0
             
@@ -6860,10 +6902,6 @@ def _session_keepalive():
 # ----------------------------------------------------------------------
 # ============ OPTIMIZED POST_INIT (With All Background Workers) ============
 async def post_init(app):
-    """
-    Called once the event loop is running inside run_polling().
-    Safe place to start Telethon worker and set _bot_loop.
-    """
     global _bot_loop, _application, _db_executor
     
     _application = app
@@ -6881,6 +6919,53 @@ async def post_init(app):
     asyncio.create_task(_notify_consumer())
     log.info("[Speed] Notification consumer started")
     
+    # 🔧 FIX #3: Clean up orphaned 0-hour offline numbers on startup
+    def cleanup_orphaned_numbers():
+        """Delete any numbers with 0 total hours that are marked offline."""
+        try:
+            with get_db() as db:
+                is_postgres = DATABASE_URL is not None
+                
+                # Count before deletion
+                if is_postgres:
+                    count_result = db.execute("""
+                        SELECT COUNT(*) as c FROM numbers 
+                        WHERE hourly_status = 'offline' 
+                        AND COALESCE(total_hours_earned, 0) = 0
+                    """).fetchone()
+                else:
+                    count_result = db.execute("""
+                        SELECT COUNT(*) as c FROM numbers 
+                        WHERE hourly_status = 'offline' 
+                        AND COALESCE(total_hours_earned, 0) = 0
+                    """).fetchone()
+                
+                orphan_count = count_result["c"] if count_result else 0
+                
+                if orphan_count > 0:
+                    # Delete the orphaned numbers
+                    if is_postgres:
+                        db.execute("""
+                            DELETE FROM numbers 
+                            WHERE hourly_status = 'offline' 
+                            AND COALESCE(total_hours_earned, 0) = 0
+                        """)
+                    else:
+                        db.execute("""
+                            DELETE FROM numbers 
+                            WHERE hourly_status = 'offline' 
+                            AND COALESCE(total_hours_earned, 0) = 0
+                        """)
+                    log.info(f"[Startup] Cleaned {orphan_count} orphaned 0-hour offline numbers")
+                else:
+                    log.info("[Startup] No orphaned 0-hour offline numbers found")
+        except Exception as e:
+            log.error(f"[Startup] Cleanup error: {e}")
+    
+    # Run cleanup in thread pool to not block startup
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, cleanup_orphaned_numbers)
+    
     # ============ START TASK4U LOGIN (Hourly Mode) ============
     def start_task4u_login():
         try:
@@ -6890,7 +6975,6 @@ async def post_init(app):
             log.error(f"[Task4U] Initial login failed: {e}")
     
     # Run Task4U login in thread pool to avoid blocking
-    loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, start_task4u_login)
     
     # ============ START TELETHON WORKER (Auto Mode) ============
