@@ -5865,7 +5865,10 @@ async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = update.effective_user.id
     
     if telegram_id != ADMIN_TELEGRAM_ID:
-        await query.edit_message_text("Unauthorized.")
+        try:
+            await query.edit_message_text("Unauthorized.")
+        except Exception:
+            await query.answer("Unauthorized.", show_alert=True)
         return
 
     # Force refresh online status from API
@@ -5885,10 +5888,14 @@ async def show_user_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """).fetchall()
 
     if not users:
-        await query.edit_message_text(
-            "No users in hourly mode.", 
-            reply_markup=admin_panel_markup
-        )
+        await query.answer("No users in hourly mode yet.")
+        try:
+            await query.edit_message_text(
+                "No users in hourly mode.",
+                reply_markup=admin_panel_markup
+            )
+        except Exception:
+            await query.message.reply_text("No users in hourly mode.")
         return
 
     # Send one message per user
@@ -6957,6 +6964,7 @@ def main():
     application.add_handler(CallbackQueryHandler(number_action_callback, pattern="^(delnum_|reauthnum_|linkagain_)"))
     application.add_handler(CallbackQueryHandler(delete_all_numbers_callback, pattern="^deleteall_"))
     application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern="^admin_"))
+    application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern="^clear_user_"))
     application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern="^earn_"))
     application.add_handler(CallbackQueryHandler(settings_callback, pattern="^sett_"))
     application.add_handler(MessageHandler(filters.Regex("^💰 Dashboard$"), dashboard))
