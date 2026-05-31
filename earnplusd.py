@@ -7000,7 +7000,7 @@ async def post_init(app):
 
 def main():
     global _application, _bot_loop
-    token = "8461339264:AAGY60FjQA4-qTkZEszhBpuDs1vXNvyKIlQ"
+    token = "8461339264:AAF3oC79wwg3lZM5bCageNN3LWDp9ca4vZI"
     if not token:
         log.error("TELEGRAM_BOT_TOKEN environment variable not set.")
         return
